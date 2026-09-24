@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Next.js
+.next/
+out/
+.turbo/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Supabase local state
+supabase/.branches/
+supabase/.temp/
+supabase/.env
+
+# Logs and editor files
+*.log
+*.tsbuildinfo
+.DS_Store
+.idea/
+.vscode/
