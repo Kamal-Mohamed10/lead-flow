@@ -1,0 +1,184 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+source database {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                String    @id @default(cuid())
+  email             String     @unique
+  name              String?
+  password          String?
+  role              Role      @default(agent)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  
+  // NextAuth
+  accounts          Account[]
+  sessions          Session[]
+  
+  // Stripe
+  stripeCustomerId  String?
+  subscription      Subscription?
+  
+  // Lead relationships
+  leads            Lead[]
+  appointments    Appointment[]
+  
+  @@map("users")
+}
+
+model Account {
+  id                String   @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId  String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session          Session   @relation(fields: [userId], references: [id])
+  
+  @@unique([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  userId       String
+  expires      DateTime
+  sessionToken String    @unique
+  user         User      @relation(fields: [userId], references: [id])
+  
+  @@map("sessions")
+}
+
+model Lead {
+  id                String    @id @default(cuid())
+  userId            String
+  address           String
+  city              String
+  state             String
+  zip               String
+  propertyType      PropertyType
+  price             Float
+  beds              Int
+  baths              Float
+  sqft              Int?
+  yearBuilt         Int?
+  stage             LeadStage    @default(ingested)
+  source            LeadSource   @default(scraped)
+  taxHistory        Json?
+  dobViolations     Json?
+  aiTranscript      String?
+  callRecordingUrl  String?
+  createdAt         DateTime   @default(now())
+  updatedAt         DateTime   @updatedAt
+  
+  user              User       @relation(fields: [userId], references: [id])
+  appointments      Appointment[]
+  
+  @@map("leads")
+}
+
+model Appointment {
+  id          String      @id @default(cuid())
+  leadId      String
+  userId      String
+  dateTime    DateTime
+  status      AppointmentStatus @default(pending)
+  meetingType MeetingType   @default(property_viewing)
+  createdAt   DateTime    @default(now())
+  
+  lead        Lead        @relation(fields: [leadId], references: [id])
+  user        User        @relation(fields: [userId], references: [id])
+  
+  @@map("appointments")
+}
+
+model Subscription {
+  id                    String   @id @default(cuid())
+  userId                String   @unique
+  stripeSubscriptionId  String   @unique
+  stripePriceId         String
+  status                SubscriptionStatus
+  currentPeriodStart    DateTime
+  currentPeriodEnd      DateTime
+  cancelAtPeriodEnd     Boolean  @default(false)
+  createdAt             DateTime @default(now())
+  
+  user                  User     @relation(fields: [userId], references: [id])
+  
+  @@map("subscriptions")
+}
+
+model PropertyScrape {
+  id          String    @id @default(cuid())
+  source      String
+  rawData     Json
+  address     String?
+  city        String?
+  state       String?
+  zip         String?
+  processed   Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+  
+  @@map("property_scrapes")
+}
+
+enum Role {
+  agent
+  lead
+  admin
+  wholesaler
+}
+
+enum PropertyType {
+  residential
+  commercial
+  multi_family
+  land
+}
+
+enum LeadStage {
+  ingested
+  ai_dialing
+  qualified
+  appointment_scheduled
+  under_contract
+}
+
+enum LeadSource {
+  scraped
+  manual
+  referral
+  webhook
+}
+
+enum AppointmentStatus {
+  pending
+  confirmed
+  cancelled
+  completed
+}
+
+enum MeetingType {
+  property_viewing
+  valuation
+  consultation
+  follow_up
+}
+
+enum SubscriptionStatus {
+  active
+  past_due
+  canceled
+  trialing
+  incomplete
+}
