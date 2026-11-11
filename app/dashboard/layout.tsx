@@ -2,7 +2,7 @@
 
 import Link from 'next/link'
 import { usePathname, useRouter } from 'next/navigation'
-import { Bookmark, LayoutDashboard, LogOut, Map, Menu, X } from 'lucide-react'
+import { Bookmark, LayoutDashboard, LogOut, Map, Menu, NotebookPen, X } from 'lucide-react'
 import { useState, useSyncExternalStore } from 'react'
 import { GlobalAiAssistant } from '@/components/global-ai-assistant'
 
@@ -66,6 +66,7 @@ export default function DashboardLayout({ children }: Readonly<{ children: React
     { name: 'Daily Overview', href: '/dashboard', icon: LayoutDashboard },
     { name: 'Explore Properties', href: '/dashboard/leads', icon: Map },
     { name: 'Watchlist', href: '/dashboard/watchlist', icon: Bookmark },
+    { name: 'Agent Notes', href: '/dashboard/notes', icon: NotebookPen },
   ]
 
   return (

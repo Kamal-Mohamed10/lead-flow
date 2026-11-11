@@ -9,6 +9,7 @@ import {
   Clock,
   Map,
   MapPin,
+  NotebookPen,
   RefreshCw,
   Search,
   Sparkles,
@@ -45,7 +46,7 @@ interface Lead {
   badgeBorder?: string
 }
 
-type DashboardFilter = 'all' | 'delivered-today' | 'high-signal' | 'qualified'
+type DashboardFilter = 'all' | 'delivered-today' | 'high-signal' | 'watchlist'
 
 export default function DashboardPage() {
   const [leads, setLeads] = useState<Lead[]>([])
@@ -201,12 +202,12 @@ export default function DashboardPage() {
     loadOpportunities(true)
   }
 
-  const qualified = leads.filter((lead) => ['qualified', 'watchlist', 'under_contract'].includes(lead.stage) || lead.dealStatus === 'watchlist').length
+  const watchlistCount = leads.filter((lead) => ['qualified', 'watchlist', 'under_contract'].includes(lead.stage) || lead.dealStatus === 'watchlist').length
   const highSignal = delivered.filter((lead) => (lead.score || 0) >= 70).length
   const todayKey = new Date().toLocaleDateString()
   const deliveredToday = delivered.filter((lead) => lead.deliveredAt && new Date(lead.deliveredAt).toLocaleDateString() === todayKey).length
 
-  const queueItems = queueFilter === 'qualified'
+  const queueItems = queueFilter === 'watchlist'
     ? leads.filter((lead) => ['qualified', 'watchlist', 'under_contract'].includes(lead.stage) || lead.dealStatus === 'watchlist')
     : queueFilter === 'high-signal'
       ? delivered.filter((lead) => (lead.score || 0) >= 70)
@@ -228,11 +229,11 @@ export default function DashboardPage() {
     ? 'High-Signal Opportunities'
     : queueFilter === 'delivered-today'
       ? 'Delivered Today'
-      : queueFilter === 'qualified'
+      : queueFilter === 'watchlist'
         ? 'Watchlist Deals'
         : 'Priority Queue'
 
-  function addToPipeline(property: Lead, stage: 'ai_dialing' | 'qualified') {
+  function addToPipeline(property: Lead, stage: 'watchlist') {
     let pipeline: Lead[] = []
     try {
       const saved = JSON.parse(localStorage.getItem('leadflow-crm-leads') || '[]')
@@ -334,11 +335,11 @@ export default function DashboardPage() {
           },
           {
             label: 'Watchlist Deals',
-            value: qualified,
+            value: watchlistCount,
             Icon: CheckCircle2,
             detail: 'Deals saved to your personal queue',
-            onClick: () => showQueue('qualified'),
-            active: queueFilter === 'qualified',
+            onClick: () => showQueue('watchlist'),
+            active: queueFilter === 'watchlist',
           },
         ].map(({ label, value, Icon, detail, onClick, active }) => (
           <button
@@ -513,16 +514,16 @@ export default function DashboardPage() {
                       {isNewOpportunity ? (
                         <div className="flex shrink-0 flex-col sm:flex-row gap-1.5 sm:pl-2 sm:pt-1">
                           <Link
-                            href={`/dashboard/properties/${encodeURIComponent(lead.id)}`}
+                            href={`/dashboard/properties/${encodeURIComponent(lead.id)}?tab=contacts`}
                             className="rounded-lg bg-[#172b2a] px-2.5 py-1.5 text-xs font-bold text-white transition hover:bg-slate-800 text-center flex items-center justify-center gap-1 shadow-xs"
                           >
-                            <span>Fetch Numbers</span>
+                            <span>Find Owner</span>
                             <span className="text-emerald-400">→</span>
                           </Link>
                           {/* Wishlist Button (User requirement #2) */}
                           <button
                             type="button"
-                            onClick={() => addToPipeline(lead, 'qualified')}
+                            onClick={() => addToPipeline(lead, 'watchlist')}
                             className="rounded-lg bg-[#176b4d] px-3 py-1.5 text-xs font-bold text-white transition hover:bg-[#12543d] flex items-center gap-1.5 shadow-xs"
                           >
                             <Bookmark className="size-3 text-emerald-200" />
@@ -543,7 +544,7 @@ export default function DashboardPage() {
               </div>
             ) : (
               <div className="mt-4 rounded-xl border border-dashed border-slate-200 bg-[#f7f8f6] p-8 text-center text-xs text-slate-500">
-                {queueFilter === 'qualified'
+                {queueFilter === 'watchlist'
                   ? 'No watchlist deals saved yet. Click "Wishlist" on any priority property to save it.'
                   : feedError
                     ? 'The priority queue could not load new opportunities.'
@@ -585,8 +586,19 @@ export default function DashboardPage() {
                   <span>View Watchlist</span>
                 </span>
                 <span className="rounded-full bg-slate-200 px-2 py-0.5 text-[10px]">
-                  {leads.filter((l) => l.dealStatus === 'watchlist' || l.stage === 'qualified').length}
+                  {watchlistCount}
                 </span>
+              </Link>
+
+              <Link
+                href="/dashboard/notes"
+                className="flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50/70 p-3.5 text-xs font-bold text-[#172b2a] transition hover:bg-slate-100"
+              >
+                <span className="flex items-center gap-2">
+                  <NotebookPen className="size-4 text-[#176b4d]" />
+                  <span>Agent Notes</span>
+                </span>
+                <ChevronRight className="size-4 text-[#176b4d]" />
               </Link>
             </div>
           </div>

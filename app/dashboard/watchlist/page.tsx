@@ -211,7 +211,7 @@ export default function WatchlistPage() {
             Watchlist
           </h1>
           <p className="mt-1 text-sm text-slate-500">
-            Your shortlisted off-market properties queued for deep title research, owner contact lookup, and outreach.
+            Your shortlisted off-market properties queued for deep title research, Find Owner lookups, and AI Agent Notes.
           </p>
         </div>
 

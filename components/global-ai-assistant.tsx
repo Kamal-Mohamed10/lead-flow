@@ -3,11 +3,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { usePathname } from 'next/navigation'
 import {
-  Minus,
   Send,
   Sparkles,
   X,
-  Building2,
   RefreshCw,
 } from 'lucide-react'
 
@@ -18,6 +16,17 @@ interface Message {
   timestamp: string
 }
 
+interface AssistantProperty {
+  id: string
+  address: string
+  borough: string
+  stage?: string
+  category?: string
+  reason?: string
+  score?: number
+  signals?: string[]
+}
+
 export function GlobalAiAssistant() {
   const pathname = usePathname()
   const [isOpen, setIsOpen] = useState(false)
@@ -26,22 +35,13 @@ export function GlobalAiAssistant() {
       id: 'welcome',
       role: 'assistant',
       content:
-        'Hi, I’m your LeadFlow Copilot. Ask me about any NYC property, distress signals (pre-foreclosure, tax lien, probate), or to draft outreach.',
+        'Hi, I’m your LeadFlow Copilot. Ask me about any NYC off-market property, distress signals (pre-foreclosure, tax lien, probate), opportunity scores, or summarizing findings for Agent Notes.',
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     },
   ])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
-  const [contextSummary, setContextSummary] = useState('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
-    let summary = 'Dashboard'
-    if (pathname.includes('/dashboard/leads')) summary = 'Pipeline'
-    else if (pathname.includes('/dashboard/properties/')) summary = 'Property'
-    else if (pathname.includes('/dashboard/actions')) summary = 'Outreach'
-    setContextSummary(summary)
-  }, [pathname])
 
   useEffect(() => {
     if (isOpen) {
@@ -66,8 +66,8 @@ export function GlobalAiAssistant() {
     setLoading(true)
 
     // Gather all local properties from CRM + delivered feed + cache
-    let allProperties: any[] = []
-    let currentProp: any = null
+    let allProperties: AssistantProperty[] = []
+    let currentProp: AssistantProperty | null = null
     try {
       const crmLeads = JSON.parse(localStorage.getItem('leadflow-crm-leads') || '[]')
       allProperties = [...crmLeads]
@@ -75,7 +75,7 @@ export function GlobalAiAssistant() {
       // Extract specific property if on a property page
       if (pathname.includes('/dashboard/properties/')) {
         const id = decodeURIComponent(pathname.split('/').pop() || '')
-        currentProp = allProperties.find((l) => l.id === id || l.address === id)
+        currentProp = allProperties.find((l) => l.id === id || l.address === id) || null
         if (!currentProp) {
           const cached = localStorage.getItem(`leadflow-property-cache-${id}`)
           if (cached) currentProp = JSON.parse(cached)
@@ -154,7 +154,7 @@ export function GlobalAiAssistant() {
       // If backend says no properties, provide a helpful answer based on available NYC intelligence
       if (!replyText || replyText.includes('no pipeline properties available')) {
         const p = currentProp || allProperties[0]
-        replyText = `Here is what I found for ${p.address} (${p.borough}):\n• Motivation: ${p.category || 'Pre-foreclosure / Distress'}\n• Rationale: ${p.reason || 'Active public filings indicate pre-auction seller timeline.'}\n• Score: ${p.score || 90}/100.\n\nWould you like me to draft a direct, non-pushy message or check contact records?`
+        replyText = `Here is what I found for ${p.address} (${p.borough}):\n• Motivation: ${p.category || 'Pre-foreclosure / Distress'}\n• Rationale: ${p.reason || 'Active public filings indicate high off-market seller likelihood.'}\n• Score: ${p.score || 90}/100.\n\nWould you like me to explain this property’s score drivers or help verify recorded ownership details for Agent Notes?`
       }
 
       setMessages((prev) => [
@@ -173,7 +173,7 @@ export function GlobalAiAssistant() {
         {
           id: `ai-${Date.now()}`,
           role: 'assistant',
-          content: `Regarding ${p ? p.address : 'NYC properties'}: I can analyze distressed signals, pre-foreclosures, tax liens, and draft custom seller outreach scripts. What would you like to review?`,
+          content: `Regarding ${p ? p.address : 'NYC properties'}: I can analyze distressed signals, pre-foreclosures, tax liens, opportunity scoring drivers, and help prepare summaries for your Agent Notes. What would you like to inspect?`,
           timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         },
       ])
@@ -260,10 +260,10 @@ export function GlobalAiAssistant() {
               🔥 Top opportunities
             </button>
             <button
-              onClick={() => setInput('Draft a warm, non-pushy opening text for pre-foreclosure')}
+              onClick={() => setInput('Explain why this property received its opportunity score')}
               className="shrink-0 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-[10px] font-bold text-slate-600 hover:bg-slate-100"
             >
-              ✍️ Opening draft
+              📊 Explain score
             </button>
             <button
               onClick={() => setInput('Explain how tax lien sales work in NYC')}

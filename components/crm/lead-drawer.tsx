@@ -126,8 +126,8 @@ export function LeadDrawer({ leadId, onClose, onUpdate }: LeadDrawerProps) {
           </div>
         </div>
         <div className="p-6 border-t border-coral-100 flex justify-end">
-          <button onClick={() => { onUpdate(lead.id, 'qualified'); onClose() }} className="px-6 py-2 rounded-lg bg-[#10243b] text-white hover:bg-[#10243b]/90">
-            Mark as Qualified
+          <button onClick={() => { onUpdate(lead.id, 'watchlist'); onClose() }} className="px-6 py-2 rounded-lg bg-[#10243b] text-white hover:bg-[#10243b]/90">
+            Save to Watchlist
           </button>
         </div>
       </div>

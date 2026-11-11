@@ -1,32 +1,28 @@
 'use client'
 
-import { useEffect, useState, use } from 'react'
+import { useCallback, useEffect, useState, use } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import {
   ArrowLeft,
-  Building2,
-  Calendar,
+  Bookmark,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
   DollarSign,
-  Download,
-  FileText,
-  Home,
-  MapPin,
-  Phone,
+  Info,
   Mail,
+  MapPin,
+  NotebookPen,
+  Phone,
   RefreshCw,
-  Send,
   Shield,
   Sparkles,
   TrendingUp,
   User,
-  Users,
 } from 'lucide-react'
-import { classifyOpportunity } from '@/lib/motivationClassifier'
-import { generateMotivationLetter } from '@/lib/letterGenerator'
+import { classifyOpportunity, explainPropertyScore } from '@/lib/motivationClassifier'
+import { upsertAgentNote } from '@/lib/agentNotes'
 
 interface LeadRecord {
   id: string
@@ -36,6 +32,7 @@ interface LeadRecord {
   block?: string
   lot?: string
   stage: string
+  dealStatus?: string
   units?: number
   yearBuilt?: number | null
   buildingClass?: string | null
@@ -53,24 +50,74 @@ interface LeadRecord {
   badgeBorder?: string
 }
 
+interface ContactCandidate {
+  name?: string | null
+  role?: string | null
+  mailingAddress?: string | null
+  phone?: string | null
+  email?: string | null
+  source?: string | null
+  isDnc?: boolean
+}
+
+interface FinancialSummary {
+  marketValue?: number | null
+  marketValueTaxYear?: string | null
+  recordedMortgage?: number | null
+  recordedMortgageDate?: string | null
+  taxLiensCount?: number
+  taxLiensEstimated?: number
+  estimatedEquity?: number | null
+  estimatedEquityPercent?: number | null
+}
+
+interface ResearchFindingItem {
+  status: string
+  headline: string
+  detail: string
+  evidence?: string[]
+}
+
+interface PropertyResearchResponse {
+  financials?: FinancialSummary | null
+  findings?: Record<string, ResearchFindingItem>
+}
+
+interface ContactResearchResponse {
+  contacts?: ContactCandidate[]
+}
+
+type PropertyTab = 'overview' | 'research' | 'contacts'
+
 export default function PropertyDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const resolvedParams = use(params)
   const router = useRouter()
   const [property, setProperty] = useState<LeadRecord | null>(null)
   const [loading, setLoading] = useState(true)
-  const [activeTab, setActiveTab] = useState<'overview' | 'research' | 'contacts' | 'outreach'>('overview')
-  const [researchData, setResearchData] = useState<any>(null)
-  const [contactData, setContactData] = useState<any>(null)
+  const [activeTab, setActiveTab] = useState<PropertyTab>('overview')
+  const [researchData, setResearchData] = useState<PropertyResearchResponse | null>(null)
+  const [contactData, setContactData] = useState<ContactResearchResponse | null>(null)
   const [researching, setResearching] = useState(false)
   const [searchingContacts, setSearchingContacts] = useState(false)
-  const [generatingBrief, setGeneratingBrief] = useState(false)
-  const [financials, setFinancials] = useState<any>(null)
+  const [financials, setFinancials] = useState<FinancialSummary | null>(null)
   const [showAdditionalContacts, setShowAdditionalContacts] = useState(false)
+  const [showScoringGuide, setShowScoringGuide] = useState(true)
 
-  const [aiBrief, setAiBrief] = useState<any>(null)
+  const [loggingNote, setLoggingNote] = useState(false)
+  const [loggedOwnerKey, setLoggedOwnerKey] = useState<string | null>(null)
+  const [noteError, setNoteError] = useState<string | null>(null)
 
   useEffect(() => {
     const propertyId = decodeURIComponent(resolvedParams.id)
+
+    let requestedTab: PropertyTab | null = null
+    try {
+      const search = new URLSearchParams(window.location.search)
+      const tab = search.get('tab')
+      if (tab === 'contacts' || tab === 'research' || tab === 'overview') {
+        requestedTab = tab
+      }
+    } catch {}
 
     // 1. Look up in stored leads or delivered opportunities
     let found: LeadRecord | null = null
@@ -81,13 +128,12 @@ export default function PropertyDetailPage({ params }: { params: Promise<{ id: s
 
     if (!found) {
       try {
-        const priorityFeed = JSON.parse(localStorage.getItem('leadflow-delivered-opportunity-ids') || '[]')
-        // Check temporary cache if available
         const cached = localStorage.getItem(`leadflow-property-cache-${propertyId}`)
         if (cached) found = JSON.parse(cached)
       } catch {}
     }
 
+    let resolvedProperty: LeadRecord
     if (found) {
       const classification = classifyOpportunity({
         documentType: found.category,
@@ -96,7 +142,7 @@ export default function PropertyDetailPage({ params }: { params: Promise<{ id: s
         address: found.address,
         bbl: found.id,
       })
-      setProperty({
+      resolvedProperty = {
         ...found,
         category: found.category || classification.category,
         categoryNumber: found.categoryNumber || classification.categoryNumber,
@@ -106,14 +152,14 @@ export default function PropertyDetailPage({ params }: { params: Promise<{ id: s
         badgeBg: found.badgeBg || classification.badgeBg,
         badgeText: found.badgeText || classification.badgeText,
         badgeBorder: found.badgeBorder || classification.badgeBorder,
-      })
+      }
     } else {
       // Reconstitute from URL ID (BBL format)
       const bbl = propertyId
       const classification = classifyOpportunity({ bbl })
       const boroughs = ['', 'Manhattan', 'Bronx', 'Brooklyn', 'Queens', 'Staten Island']
       const boroughName = boroughs[Number(bbl[0])] || 'New York'
-      setProperty({
+      resolvedProperty = {
         id: bbl,
         address: `NYC Property Parcel #${bbl}`,
         borough: boroughName,
@@ -128,37 +174,30 @@ export default function PropertyDetailPage({ params }: { params: Promise<{ id: s
         badgeText: classification.badgeText,
         badgeBorder: classification.badgeBorder,
         signals: [`${classification.category}: ${classification.subheadline}`, classification.reason],
-      })
+      }
     }
 
-    setLoading(false)
+    queueMicrotask(() => {
+      if (requestedTab) setActiveTab(requestedTab)
+      setProperty(resolvedProperty)
+      setLoading(false)
+    })
   }, [resolvedParams.id])
 
-  // Automatically trigger forensic research and contact lookup on page load so numbers and contacts show immediately
-  useEffect(() => {
-    if (property?.id && !researchData && !researching) {
-      void loadResearch()
-    }
-    if (property?.id && !contactData && !searchingContacts) {
-      void loadContacts()
-    }
-  }, [property?.id])
-
-  async function loadResearch() {
-    if (!property) return
+  const loadResearchFor = useCallback(async (target: LeadRecord) => {
     setResearching(true)
     try {
       const response = await fetch('/api/nyc/property-research', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          address: property.address,
-          borough: property.borough,
-          zip: property.zip,
-          bbl: property.id,
+          address: target.address,
+          borough: target.borough,
+          zip: target.zip,
+          bbl: target.id,
         }),
       })
-      const data = await response.json()
+      const data = (await response.json()) as PropertyResearchResponse
       setResearchData(data)
       setFinancials(data.financials || null)
     } catch {
@@ -167,53 +206,118 @@ export default function PropertyDetailPage({ params }: { params: Promise<{ id: s
     } finally {
       setResearching(false)
     }
-  }
+  }, [])
 
-  async function loadContacts() {
-    if (!property) return
+  const loadContactsFor = useCallback(async (target: LeadRecord) => {
     setSearchingContacts(true)
     try {
       const response = await fetch('/api/nyc/contact-research', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          bbl: property.id,
-          address: property.address,
-          borough: property.borough,
+          bbl: target.id,
+          address: target.address,
+          borough: target.borough,
         }),
       })
-      const data = await response.json()
+      const data = (await response.json()) as ContactResearchResponse
       setContactData(data)
     } catch {
       setContactData(null)
     } finally {
       setSearchingContacts(false)
     }
+  }, [])
+
+  // Automatically trigger forensic research and contact lookup on page load so numbers and contacts show immediately
+  useEffect(() => {
+    if (!property?.id) return
+    const timer = setTimeout(() => {
+      if (!researchData && !researching) void loadResearchFor(property)
+      if (!contactData && !searchingContacts) void loadContactsFor(property)
+    }, 0)
+    return () => clearTimeout(timer)
+  }, [property, researchData, researching, contactData, searchingContacts, loadResearchFor, loadContactsFor])
+
+  function loadResearch() {
+    if (property) void loadResearchFor(property)
   }
 
-  function handleGenerateLetter() {
-  if (!property) return;
-  generateMotivationLetter({
-    ownerName: contactData?.contacts?.[0]?.name || '',
-    propertyAddress: property.address,
-    borough: property.borough,
-    mailingAddress: contactData?.contacts?.[0]?.mailingAddress || null,
-    category: property.category,
-    categoryNumber: property.categoryNumber,
-    agentName: 'LeadFlow NYC Agent',
-    agentPhone: '(212) 555-0199',
-    agentEmail: 'agent@leadflownyc.com',
-  });
-}
+  function loadContacts() {
+    if (property) void loadContactsFor(property)
+  }
 
-function saveToPipeline(stage: string) {
+  function saveToWatchlist() {
     if (!property) return
     try {
       const existing = JSON.parse(localStorage.getItem('leadflow-crm-leads') || '[]') as LeadRecord[]
-      const updated = [{ ...property, stage }, ...existing.filter((item) => item.id !== property.id)]
+      const updated = [
+        { ...property, stage: 'watchlist', dealStatus: 'watchlist' },
+        ...existing.filter((item) => item.id !== property.id),
+      ]
       localStorage.setItem('leadflow-crm-leads', JSON.stringify(updated))
-      setProperty({ ...property, stage })
+      setProperty({ ...property, stage: 'watchlist', dealStatus: 'watchlist' })
     } catch {}
+  }
+
+  async function saveToAgentNotes(contactOverride?: ContactCandidate, keyLabel = 'primary') {
+    if (!property || loggingNote) return
+    setLoggingNote(true)
+    setNoteError(null)
+    try {
+      const chosen = contactOverride || (contactData?.contacts?.[0] as ContactCandidate | undefined)
+      const response = await fetch('/api/ai/agent-notes', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          propertyId: property.id,
+          address: property.address,
+          borough: property.borough,
+          zip: property.zip || null,
+          units: property.units ?? null,
+          yearBuilt: property.yearBuilt ?? null,
+          buildingClass: property.buildingClass ?? null,
+          score: property.score ?? null,
+          category: property.category ?? null,
+          reason: property.reason ?? null,
+          opportunityAngle: property.opportunityAngle ?? null,
+          signals: property.signals || [],
+          ownerName: chosen?.name || null,
+          phone: chosen?.isDnc ? null : chosen?.phone || null,
+          email: chosen?.email || null,
+          mailingAddress: chosen?.mailingAddress || null,
+          isDnc: Boolean(chosen?.isDnc),
+          financials: financials || null,
+        }),
+      })
+      const draft = await response.json()
+      if (!response.ok) {
+        throw new Error(draft.error || 'Could not compile Agent Note with AI.')
+      }
+
+      upsertAgentNote({
+        id: `note-${property.id}-${Date.now()}`,
+        propertyId: property.id,
+        address: draft.address || property.address,
+        borough: property.borough,
+        zip: property.zip,
+        ownerName: draft.ownerName || chosen?.name || 'Recorded Deed Holder',
+        contactInfo: draft.contactInfo || 'Pending direct phone verification',
+        propertyDescription: draft.propertyDescription,
+        motivatingFactor: draft.motivatingFactor,
+        score: property.score ?? 85,
+        category: property.category ?? null,
+        aiGenerated: true,
+        modelUsed: draft.model || 'LeadFlow AI',
+        createdAt: new Date().toISOString(),
+      })
+
+      setLoggedOwnerKey(keyLabel)
+    } catch (error) {
+      setNoteError(error instanceof Error ? error.message : 'Unable to save Agent Note.')
+    } finally {
+      setLoggingNote(false)
+    }
   }
 
   if (loading) {
@@ -235,10 +339,34 @@ function saveToPipeline(stage: string) {
     )
   }
 
+  const isWatchlisted =
+    property.dealStatus === 'watchlist' ||
+    property.dealStatus === 'vault' ||
+    property.stage === 'watchlist' ||
+    property.stage === 'qualified'
+
+  const statusLabel =
+    property.stage === 'qualified' || property.stage === 'watchlist'
+      ? 'Watchlist'
+      : property.stage.replace('_', ' ')
+
+  const scoreBreakdown = explainPropertyScore({
+    score: property.score,
+    category: property.category,
+    reason: property.reason,
+    yearBuilt: property.yearBuilt,
+    units: property.units,
+    signals: property.signals,
+    marketValue: financials?.marketValue,
+    recordedMortgage: financials?.recordedMortgage,
+    taxLiensCount: financials?.taxLiensCount,
+    estimatedEquityPercent: financials?.estimatedEquityPercent,
+  })
+
   return (
     <div className="mx-auto max-w-6xl space-y-6 pb-16">
       {/* Back button & Breadcrumb */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <button
           onClick={() => router.back()}
           className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-slate-500 hover:text-slate-900"
@@ -249,7 +377,7 @@ function saveToPipeline(stage: string) {
         <div className="flex items-center gap-2">
           <span className="text-xs font-semibold text-slate-400">Workspace Status:</span>
           <span className="rounded-full bg-[#edf7f2] px-3 py-1 text-xs font-black uppercase tracking-wider text-[#176b4d]">
-            {property.stage === 'qualified' ? 'Watchlist' : property.stage.replace('_', ' ')}
+            {statusLabel}
           </span>
         </div>
       </div>
@@ -284,7 +412,7 @@ function saveToPipeline(stage: string) {
             </h1>
 
             <p className="text-base font-semibold text-slate-700">
-              {property.subheadline || 'High-probability seller move signal'}
+              {property.subheadline || 'High-probability off-market seller signal'}
             </p>
           </div>
 
@@ -304,37 +432,66 @@ function saveToPipeline(stage: string) {
                 className="flex items-center justify-center gap-2 rounded-xl bg-[#172b2a] px-5 py-3 text-xs font-bold text-white shadow-sm transition hover:bg-slate-800 disabled:opacity-60"
               >
                 <Phone className="size-3.5 text-emerald-400" />
-                {searchingContacts ? 'Searching Numbers...' : 'AI Fetch Owner Numbers'}
+                {searchingContacts ? 'Finding Owner...' : 'Find Owner'}
               </button>
+
               <button
-                onClick={() => saveToPipeline('qualified')}
-                className="flex items-center justify-center gap-2 rounded-xl bg-[#176b4d] px-5 py-2.5 text-xs font-bold text-white shadow-sm transition hover:bg-[#12543d]"
+                onClick={saveToWatchlist}
+                className={`flex items-center justify-center gap-2 rounded-xl px-5 py-2.5 text-xs font-bold shadow-sm transition ${
+                  isWatchlisted
+                    ? 'border border-emerald-200 bg-emerald-50 text-[#176b4d]'
+                    : 'bg-[#176b4d] text-white hover:bg-[#12543d]'
+                }`}
               >
-                <CheckCircle2 className="size-4" />
-                Move to Qualified
+                <Bookmark className={`size-4 ${isWatchlisted ? 'fill-current' : ''}`} />
+                {isWatchlisted ? 'Saved in Watchlist' : 'Save to Watchlist'}
               </button>
-              <Link
-                href="/dashboard/actions"
-                className="flex items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-5 py-2 text-xs font-bold text-slate-700 shadow-sm transition hover:bg-slate-50"
+
+              <button
+                type="button"
+                onClick={() => void saveToAgentNotes(undefined, 'hero')}
+                disabled={loggingNote}
+                className="flex items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-5 py-2 text-xs font-bold text-[#172b2a] shadow-sm transition hover:border-[#176b4d] hover:bg-[#edf7f2] disabled:opacity-60"
               >
-                <Sparkles className="size-3.5 text-[#176b4d]" />
-                Draft Outreach in AI
-              </Link>
+                <NotebookPen className="size-3.5 text-[#176b4d]" />
+                {loggingNote ? 'AI Compiling Note...' : loggedOwnerKey ? 'Saved to Agent Notes ✓' : 'AI Log to Agent Notes'}
+              </button>
             </div>
           </div>
         </div>
 
+        {(loggedOwnerKey || noteError) && (
+          <div className="mt-4">
+            {noteError && (
+              <p role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-2.5 text-xs font-semibold text-rose-800">
+                {noteError}
+              </p>
+            )}
+            {loggedOwnerKey && !noteError && (
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-xs font-bold text-emerald-900">
+                <span className="flex items-center gap-2">
+                  <CheckCircle2 className="size-4 text-[#176b4d]" />
+                  AI logged the address, owner name, contact info, property brief, and motivating factor to Agent Notes.
+                </span>
+                <Link href="/dashboard/notes" className="underline hover:text-[#176b4d]">
+                  View in Agent Notes →
+                </Link>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Why it surfaced block */}
         <div className="mt-6 rounded-2xl border border-slate-100 bg-[#f7f8f6] p-5">
           <p className="text-xs font-black uppercase tracking-wider text-[#176b4d]">
-            Why This Property Came Up & Motivation Rationale
+            Why This Property Came Up &amp; Motivation Rationale
           </p>
           <p className="mt-1.5 text-sm font-semibold leading-relaxed text-[#172b2a]">
-            {property.reason || 'Public record filings indicate pre-auction seller distress.'}
+            {property.reason || 'Public record filings indicate strong off-market sale likelihood.'}
           </p>
           {property.opportunityAngle && (
-            <p className="mt-2 text-xs leading-relaxed text-slate-600 bg-white/80 p-3 rounded-xl border border-slate-200/50">
-              <strong>Recommended Agent Angle: </strong>
+            <p className="mt-2 rounded-xl border border-slate-200/50 bg-white/80 p-3 text-xs leading-relaxed text-slate-600">
+              <strong>Research &amp; Acquisition Angle: </strong>
               {property.opportunityAngle}
             </p>
           )}
@@ -348,15 +505,15 @@ function saveToPipeline(stage: string) {
                 <span className="flex size-6 items-center justify-center rounded-lg bg-[#176b4d] text-white">
                   <DollarSign className="size-3.5" />
                 </span>
-                <h3 className="text-sm font-black text-[#172b2a]">$0 Free Public Equity & Debt Breakdown</h3>
+                <h3 className="text-sm font-black text-[#172b2a]">Public Equity &amp; Debt Breakdown</h3>
               </div>
-              <p className="text-xs text-slate-500 mt-0.5">
-                Calculated directly from NYC DOF Market Valuations, ACRIS Recorded Mortgages & DOF Lien Registries
+              <p className="mt-0.5 text-xs text-slate-500">
+                Calculated directly from NYC DOF Market Valuations, ACRIS Recorded Mortgages &amp; DOF Lien Registries
               </p>
             </div>
             {researching && (
               <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-100 px-2.5 py-0.5 text-[11px] font-bold text-emerald-800">
-                <RefreshCw className="size-3 animate-spin" /> Fetching live NYC registries...
+                <RefreshCw className="size-3 animate-spin" /> Checking live NYC registries...
               </span>
             )}
           </div>
@@ -394,7 +551,7 @@ function saveToPipeline(stage: string) {
               <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Municipal Liens</span>
               <p className="mt-1 text-lg font-black text-amber-700">
                 {financials?.taxLiensCount
-                  ? `$${financials.taxLiensEstimated.toLocaleString()}`
+                  ? `$${(financials.taxLiensEstimated || 0).toLocaleString()}`
                   : researching
                   ? 'Scanning...'
                   : '$0'}
@@ -413,7 +570,7 @@ function saveToPipeline(stage: string) {
                   ? '...'
                   : '~$530,000'}
               </p>
-              <span className="text-[10px] text-emerald-100 font-bold">
+              <span className="text-[10px] font-bold text-emerald-100">
                 {financials?.estimatedEquityPercent !== null && financials?.estimatedEquityPercent !== undefined
                   ? `${financials.estimatedEquityPercent}% Equity Spread`
                   : '~62% Equity Spread'}
@@ -425,23 +582,22 @@ function saveToPipeline(stage: string) {
 
       {/* Navigation Tabs */}
       <div className="flex flex-wrap gap-2 border-b border-slate-200 pb-3">
-        {[
-          { id: 'overview', label: 'Property Overview & PLUTO Details' },
+        {([
+          { id: 'overview', label: 'Property Overview & Scoring Intelligence' },
           { id: 'research', label: 'Instant Forensic Research' },
-          { id: 'contacts', label: 'Ownership & Contact Directory' },
-          { id: 'outreach', label: 'Outreach & Action Plan' },
-        ].map((tab) => (
+          { id: 'contacts', label: 'Find Owner & Contact Directory' },
+        ] as const).map((tab) => (
           <button
             key={tab.id}
             onClick={() => {
-              setActiveTab(tab.id as any)
+              setActiveTab(tab.id)
               if (tab.id === 'research' && !researchData) void loadResearch()
               if (tab.id === 'contacts' && !contactData) void loadContacts()
             }}
             className={`rounded-xl px-4 py-2.5 text-xs font-bold transition ${
               activeTab === tab.id
                 ? 'bg-[#172b2a] text-white shadow-sm'
-                : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'
+                : 'border border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
             }`}
           >
             {tab.label}
@@ -452,23 +608,23 @@ function saveToPipeline(stage: string) {
       {/* Tab 1: Overview */}
       {activeTab === 'overview' && (
         <div className="grid gap-6 md:grid-cols-2">
-          <div className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-sm space-y-4">
+          <div className="space-y-4 rounded-2xl border border-slate-200/80 bg-white p-6 shadow-sm">
             <h2 className="text-base font-black text-[#172b2a]">Building Specifications</h2>
             <div className="grid grid-cols-2 gap-3 text-sm">
               <div className="rounded-xl bg-slate-50 p-3.5">
-                <span className="text-xs text-slate-400 font-bold uppercase">Residential Units</span>
+                <span className="text-xs font-bold uppercase text-slate-400">Residential Units</span>
                 <p className="mt-1 font-black text-[#172b2a]">{property.units || 'Single / 1-3 Family'}</p>
               </div>
               <div className="rounded-xl bg-slate-50 p-3.5">
-                <span className="text-xs text-slate-400 font-bold uppercase">Year Built</span>
+                <span className="text-xs font-bold uppercase text-slate-400">Year Built</span>
                 <p className="mt-1 font-black text-[#172b2a]">{property.yearBuilt || 'Estimated Pre-War'}</p>
               </div>
               <div className="rounded-xl bg-slate-50 p-3.5">
-                <span className="text-xs text-slate-400 font-bold uppercase">Building Class</span>
+                <span className="text-xs font-bold uppercase text-slate-400">Building Class</span>
                 <p className="mt-1 font-black text-[#172b2a]">{property.buildingClass || 'Residential Class A'}</p>
               </div>
               <div className="rounded-xl bg-slate-50 p-3.5">
-                <span className="text-xs text-slate-400 font-bold uppercase">Borough Tax District</span>
+                <span className="text-xs font-bold uppercase text-slate-400">Borough Tax District</span>
                 <p className="mt-1 font-black text-[#172b2a]">{property.borough}</p>
               </div>
             </div>
@@ -484,39 +640,122 @@ function saveToPipeline(stage: string) {
                 ))}
               </ul>
             </div>
-          </div>
 
-          <div className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-sm space-y-4">
-            <h2 className="text-base font-black text-[#172b2a]">Market Intelligence & Next Move</h2>
-            <p className="text-xs leading-relaxed text-slate-600">
-              This property surfaced because its motivation signature matched active pre-foreclosure, tax delinquency, or probate triggers in NYC Department of Finance and court registries.
-            </p>
-
-            <div className="rounded-xl border border-violet-100 bg-violet-50/70 p-4 space-y-2">
-              <p className="text-xs font-black uppercase tracking-wider text-violet-900">Recommended Next Steps</p>
-              <ol className="list-decimal pl-4 text-xs space-y-1.5 text-violet-950 font-medium">
-                <li>Review the instant forensic findings below to verify title status.</li>
-                <li>Check the recorded owner mailing address and entity contacts.</li>
-                <li>Reach out with a private, consultative consultation before auction.</li>
+            <div className="rounded-xl border border-slate-200 bg-[#f7f8f6] p-4 space-y-2">
+              <p className="text-xs font-black uppercase tracking-wider text-[#172b2a]">Research Workflow</p>
+              <ol className="list-decimal space-y-1.5 pl-4 text-xs font-medium text-slate-700">
+                <li>Inspect forensic title filings, municipal liens, and violations.</li>
+                <li>Use <strong>Find Owner</strong> to uncover deed holders, mailing addresses, and public phone records.</li>
+                <li>Have AI compile the address, owner contact info, property brief, and motivating factor into <strong>Agent Notes</strong>.</li>
               </ol>
             </div>
+          </div>
 
-            <div className="flex gap-2 pt-2">
+          {/* Market Intelligence & Scoring System Explanation */}
+          <div className="space-y-4 rounded-2xl border border-slate-200/80 bg-white p-6 shadow-sm">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <TrendingUp className="size-4 text-[#176b4d]" />
+                <h2 className="text-base font-black text-[#172b2a]">Market Intelligence</h2>
+              </div>
+              <span className={`rounded-full border px-2.5 py-0.5 text-[11px] font-black ${scoreBreakdown.tierColor}`}>
+                Score {scoreBreakdown.totalScore}/100 · {scoreBreakdown.tier}
+              </span>
+            </div>
+
+            <div className="rounded-xl border border-emerald-200 bg-emerald-50/50 p-4">
+              <p className="text-[11px] font-black uppercase tracking-wider text-[#176b4d]">
+                Why This Property Scored {scoreBreakdown.totalScore}/100
+              </p>
+              <p className="mt-1.5 text-xs leading-relaxed text-slate-700">{scoreBreakdown.summary}</p>
+            </div>
+
+            {/* Factor-by-factor driver list for this property */}
+            <div className="space-y-2.5">
+              {scoreBreakdown.factors.map((factor) => (
+                <div key={factor.label} className="rounded-xl border border-slate-200/80 bg-[#f7f8f6] p-3.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-xs font-black text-[#172b2a]">{factor.label}</span>
+                    <div className="flex items-center gap-1.5">
+                      <span className="rounded-md bg-white px-2 py-0.5 text-[10px] font-bold text-slate-600 border border-slate-200">
+                        {factor.weight}
+                      </span>
+                      <span
+                        className={`rounded-md px-2 py-0.5 text-[10px] font-black uppercase ${
+                          factor.impact === 'High'
+                            ? 'bg-emerald-100 text-emerald-800'
+                            : factor.impact === 'Moderate'
+                              ? 'bg-amber-100 text-amber-800'
+                              : 'bg-slate-200 text-slate-700'
+                        }`}
+                      >
+                        {factor.impact} Impact
+                      </span>
+                    </div>
+                  </div>
+                  <p className="mt-1.5 text-xs leading-relaxed text-slate-600">{factor.detail}</p>
+                </div>
+              ))}
+            </div>
+
+            {/* Explanation of LeadFlow's overall scoring system */}
+            <div className="rounded-xl border border-slate-200 bg-white p-4">
+              <button
+                type="button"
+                onClick={() => setShowScoringGuide((v) => !v)}
+                className="flex w-full items-center justify-between text-left"
+              >
+                <span className="flex items-center gap-2 text-xs font-black uppercase tracking-wider text-[#172b2a]">
+                  <Info className="size-3.5 text-[#176b4d]" />
+                  How Our 0–100 Scoring System Works
+                </span>
+                {showScoringGuide ? (
+                  <ChevronUp className="size-4 text-slate-400" />
+                ) : (
+                  <ChevronDown className="size-4 text-slate-400" />
+                )}
+              </button>
+
+              {showScoringGuide && (
+                <div className="mt-3 space-y-2.5 border-t border-slate-100 pt-3">
+                  {scoreBreakdown.systemPillars.map((pillar) => (
+                    <div key={pillar.title} className="text-xs leading-relaxed">
+                      <div className="flex items-center justify-between font-bold text-[#172b2a]">
+                        <span>{pillar.title}</span>
+                        <span className="font-mono text-[10px] text-[#176b4d]">{pillar.maxPoints}</span>
+                      </div>
+                      <p className="mt-0.5 text-[11px] text-slate-600">{pillar.description}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 pt-1">
               <button
                 onClick={() => {
                   setActiveTab('research')
                   if (!researchData) void loadResearch()
                 }}
-                className="w-full rounded-xl bg-[#172b2a] py-3 text-xs font-bold text-white transition hover:bg-slate-800"
+                className="rounded-xl border border-slate-200 bg-white py-3 text-xs font-bold text-[#172b2a] transition hover:bg-slate-50"
               >
-                Open Instant Forensic Research →
+                Forensic Research →
+              </button>
+              <button
+                onClick={() => {
+                  setActiveTab('contacts')
+                  if (!contactData) void loadContacts()
+                }}
+                className="rounded-xl bg-[#172b2a] py-3 text-xs font-bold text-white transition hover:bg-slate-800"
+              >
+                Find Owner →
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Tab 2: Instant Forensic Research (Accessible directly WITHOUT putting into researching!) */}
+      {/* Tab 2: Instant Forensic Research */}
       {activeTab === 'research' && (
         <div className="space-y-6">
           <div className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-sm">
@@ -542,14 +781,14 @@ function saveToPipeline(stage: string) {
               </div>
             ) : researchData?.findings ? (
               <div className="mt-5 grid gap-4 md:grid-cols-2">
-                {Object.entries(researchData.findings).map(([key, finding]: [string, any]) => (
+                {Object.entries(researchData.findings).map(([key, finding]: [string, ResearchFindingItem]) => (
                   <div key={key} className="rounded-xl border border-slate-200 bg-slate-50/50 p-4">
                     <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
                       {key.replace(/([A-Z])/g, ' $1')}
                     </span>
                     <p className="mt-1 text-sm font-black text-[#172b2a]">{finding.headline}</p>
                     <p className="mt-1 text-xs leading-relaxed text-slate-600">{finding.detail}</p>
-                    {finding.evidence?.length > 0 && (
+                    {finding.evidence && finding.evidence.length > 0 && (
                       <ul className="mt-2.5 space-y-1 border-t border-slate-200/60 pt-2 text-[11px] text-slate-500">
                         {finding.evidence.map((ev: string, idx: number) => (
                           <li key={idx}>• {ev}</li>
@@ -568,13 +807,13 @@ function saveToPipeline(stage: string) {
         </div>
       )}
 
-      {/* Tab 3: Contacts */}
+      {/* Tab 3: Find Owner & Contacts */}
       {activeTab === 'contacts' && (
         <div className="space-y-6">
           <div className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-sm">
             <div className="flex items-center justify-between border-b pb-4">
               <div>
-                <h2 className="text-base font-black text-[#172b2a]">Recorded Owners & Verified Contacts</h2>
+                <h2 className="text-base font-black text-[#172b2a]">Recorded Owners &amp; Verified Contacts</h2>
                 <p className="text-xs text-slate-500">De-duplicated deed parties, registered managing agents, and public tax rolls.</p>
               </div>
               <button
@@ -583,7 +822,7 @@ function saveToPipeline(stage: string) {
                 className="flex items-center gap-2 rounded-xl border border-slate-200 px-3.5 py-2 text-xs font-bold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
               >
                 <RefreshCw className={`size-3.5 ${searchingContacts ? 'animate-spin' : ''}`} />
-                {searchingContacts ? 'Searching...' : 'Refresh Contacts'}
+                {searchingContacts ? 'Finding Owner...' : 'Refresh Find Owner'}
               </button>
             </div>
 
@@ -594,36 +833,48 @@ function saveToPipeline(stage: string) {
               </div>
             ) : (
               <div className="mt-5 space-y-4">
-                {/* 1-Click Direct Mail Generator Action Card */}
+                {/* AI Agent Notes Logger Card */}
                 <div className="flex flex-col gap-3 rounded-xl border border-emerald-200 bg-emerald-50/70 p-4 sm:flex-row sm:items-center sm:justify-between">
                   <div>
-                    <h3 className="text-xs font-black uppercase tracking-wider text-emerald-900">
-                      1-Click Direct Mail Letter Generator ($0)
+                    <h3 className="flex items-center gap-1.5 text-xs font-black uppercase tracking-wider text-emerald-900">
+                      <Sparkles className="size-3.5 text-[#176b4d]" />
+                      AI Agent Notes Logger
                     </h3>
                     <p className="mt-0.5 text-xs text-emerald-800">
-                      Instantly builds a tailored off-market advisory letter for this {property.category || 'opportunity'} addressed to the recorded legal owner.
+                      Once you find an owner number or contact details, AI automatically logs the property address, owner name, contact info, brief property description, and motivating factor to Agent Notes.
                     </p>
                   </div>
-                  <button
-                    onClick={handleGenerateLetter}
-                    className="flex shrink-0 items-center justify-center gap-2 rounded-xl bg-[#176b4d] px-4 py-2.5 text-xs font-bold text-white shadow-xs transition hover:bg-[#12543d]"
-                  >
-                    <Download className="size-4" />
-                    Download Printable Letter PDF
-                  </button>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => void saveToAgentNotes(contactData?.contacts?.[0], 'banner')}
+                      disabled={loggingNote}
+                      className="flex items-center justify-center gap-2 rounded-xl bg-[#176b4d] px-4 py-2.5 text-xs font-bold text-white shadow-xs transition hover:bg-[#12543d] disabled:opacity-60"
+                    >
+                      <NotebookPen className="size-4" />
+                      {loggingNote ? 'Compiling...' : loggedOwnerKey === 'banner' ? 'Logged to Agent Notes ✓' : 'AI Save to Agent Notes'}
+                    </button>
+                    <Link
+                      href="/dashboard/notes"
+                      className="rounded-xl border border-emerald-300 bg-white px-3 py-2.5 text-xs font-bold text-[#172b2a] hover:bg-emerald-50"
+                    >
+                      Open Log →
+                    </Link>
+                  </div>
                 </div>
 
                 {contactData?.contacts?.length ? (() => {
                   const primaryContact = contactData.contacts[0]
                   const additionalContacts = contactData.contacts.slice(1)
 
-                  const renderContactCard = (c: any, isPrimary: boolean, key: string | number) => {
+                  const renderContactCard = (c: ContactCandidate, isPrimary: boolean, key: string | number) => {
                     const cleanName = encodeURIComponent((c.name || '').replace(/[^a-zA-Z0-9 ]/g, '').trim())
                     const cleanBorough = encodeURIComponent(property.borough || 'New York')
                     const fastPeopleUrl = `https://www.fastpeoplesearch.com/name/${cleanName}_${cleanBorough}-NY`
                     const truePeopleUrl = `https://www.truepeoplesearch.com/results?name=${cleanName}&citystatezip=${cleanBorough},%20NY`
                     const nysCorpUrl = `https://apps.dos.ny.gov/publicInquiry/EntityDisplay?entity_name=${cleanName}`
                     const isEntity = /(LLC|CORP|INC|HOLDINGS|PROPERTIES|LP|GROUP)/i.test(c.name || '')
+                    const cardKey = `contact-${key}`
 
                     return (
                       <div
@@ -640,14 +891,14 @@ function saveToPipeline(stage: string) {
                               <User className="size-4 text-[#176b4d]" />
                               <p className="font-black text-slate-900">{c.name || 'Recorded Party'}</p>
                               {isPrimary && (
-                                <span className="rounded-full bg-[#176b4d] px-2 py-0.5 text-[10px] font-bold text-white uppercase tracking-wider">
+                                <span className="rounded-full bg-[#176b4d] px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-white">
                                   Primary Owner
                                 </span>
                               )}
                             </div>
                             <p className="mt-0.5 text-xs font-semibold text-[#176b4d]">{c.role}</p>
                           </div>
-                          <span className="rounded-md bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-500 self-start">
+                          <span className="self-start rounded-md bg-slate-100 px-2 py-0.5 text-[10px] font-bold text-slate-500">
                             {c.source || 'Public Record'}
                           </span>
                         </div>
@@ -668,10 +919,10 @@ function saveToPipeline(stage: string) {
                           ) : c.phone ? (
                             <a
                               href={`tel:${c.phone}`}
-                              className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-1.5 font-bold text-white shadow-xs hover:bg-emerald-700 transition"
+                              className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-1.5 font-bold text-white shadow-xs transition hover:bg-emerald-700"
                             >
                               <Phone className="size-3.5" />
-                              <span>Call: {c.phone}</span>
+                              <span>{c.phone}</span>
                             </a>
                           ) : null}
                           {c.email && (
@@ -683,6 +934,16 @@ function saveToPipeline(stage: string) {
                               {c.email}
                             </a>
                           )}
+
+                          <button
+                            type="button"
+                            onClick={() => void saveToAgentNotes(c, cardKey)}
+                            disabled={loggingNote}
+                            className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-300 bg-white px-3 py-1.5 font-bold text-[#172b2a] shadow-xs transition hover:bg-emerald-50 disabled:opacity-50"
+                          >
+                            <NotebookPen className="size-3.5 text-[#176b4d]" />
+                            <span>{loggedOwnerKey === cardKey ? 'Logged to Agent Notes ✓' : 'Add to Agent Notes (AI)'}</span>
+                          </button>
 
                           {/* Free Reverse Lookup Shortcuts */}
                           <div className="flex flex-wrap items-center gap-2 pt-1 sm:pt-0">
@@ -727,7 +988,7 @@ function saveToPipeline(stage: string) {
                       {/* Highlighted Primary Owner Card */}
                       {renderContactCard(primaryContact, true, 'primary-contact')}
 
-                      {/* Dropdown for Additional/Historical Contacts to Prevent Overload */}
+                      {/* Dropdown for Additional/Historical Contacts */}
                       {additionalContacts.length > 0 && (
                         <div className="pt-2">
                           <button
@@ -737,7 +998,7 @@ function saveToPipeline(stage: string) {
                           >
                             <span className="flex items-center gap-2">
                               <span>Show {additionalContacts.length} Other Historical / Recorded Parties</span>
-                              <span className="rounded-full bg-slate-200 px-2 py-0.5 text-[10px] text-slate-600 font-bold">
+                              <span className="rounded-full bg-slate-200 px-2 py-0.5 text-[10px] font-bold text-slate-600">
                                 {showAdditionalContacts ? 'Expanded' : 'Collapsed'}
                               </span>
                             </span>
@@ -749,8 +1010,8 @@ function saveToPipeline(stage: string) {
                           </button>
 
                           {showAdditionalContacts && (
-                            <div className="mt-3 space-y-3 pl-1 border-l-2 border-slate-200">
-                              {additionalContacts.map((c: any, idx: number) =>
+                            <div className="mt-3 space-y-3 border-l-2 border-slate-200 pl-1">
+                              {additionalContacts.map((c: ContactCandidate, idx: number) =>
                                 renderContactCard(c, false, `additional-${idx}`)
                               )}
                             </div>
@@ -761,36 +1022,12 @@ function saveToPipeline(stage: string) {
                   )
                 })() : (
                   <div className="py-6 text-center text-xs text-slate-500">
-                    No registered party phone numbers returned. Use the <strong>Download Printable Letter PDF</strong> button above to send direct mail to the recorded deed address, or run a free reverse lookup.
+                    No registered party phone numbers returned directly from municipal registries. Use{' '}
+                    <strong>AI Save to Agent Notes</strong> above to log the property brief and motivating factor while you verify secondary contact channels.
                   </div>
                 )}
               </div>
             )}
-          </div>
-        </div>
-      )}
-
-      {/* Tab 4: Outreach Plan */}
-      {activeTab === 'outreach' && (
-        <div className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-sm space-y-4">
-          <h2 className="text-base font-black text-[#172b2a]">Direct Outreach Strategy</h2>
-          <p className="text-xs leading-relaxed text-slate-600">
-            Tailor your conversation to the {property.category || 'opportunity'} trigger. Start with empathy and offering options rather than pushing an immediate sale.
-          </p>
-
-          <div className="rounded-xl border border-slate-200 bg-[#f7f8f6] p-4 text-xs leading-relaxed text-slate-700">
-            <strong className="block text-sm font-bold text-[#172b2a] mb-1">Recommended Opening Hook:</strong>
-            “Hi, I was reviewing recent city property public notices regarding {property.address} and wanted to reach out directly to see if our private client group could help you explore an off-market solution or equity payout before any court deadlines.”
-          </div>
-
-          <div className="pt-2">
-            <Link
-              href="/dashboard/actions"
-              className="inline-flex items-center gap-2 rounded-xl bg-[#172b2a] px-5 py-3 text-xs font-bold text-white hover:bg-slate-800 transition"
-            >
-              <Send className="size-4" />
-              Open AI Workspace to Compose Outreach Draft
-            </Link>
           </div>
         </div>
       )}

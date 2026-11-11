@@ -111,6 +111,155 @@ export const OPPORTUNITY_CATEGORIES: Record<OpportunityCategoryKey, OpportunityC
   },
 }
 
+export interface ScoreFactor {
+  label: string
+  weight: string
+  impact: 'High' | 'Moderate' | 'Supporting'
+  detail: string
+}
+
+export interface ScoreExplanation {
+  totalScore: number
+  tier: string
+  tierColor: string
+  summary: string
+  factors: ScoreFactor[]
+  systemPillars: Array<{
+    title: string
+    maxPoints: string
+    description: string
+  }>
+}
+
+/**
+ * Generates a transparent breakdown explaining why a specific property received its score
+ * alongside an overview of how LeadFlow's 0-100 scoring system works.
+ */
+export function explainPropertyScore(input: {
+  score?: number | null
+  category?: string | null
+  reason?: string | null
+  yearBuilt?: number | null
+  units?: number | null
+  signals?: string[]
+  marketValue?: number | null
+  recordedMortgage?: number | null
+  taxLiensCount?: number
+  estimatedEquityPercent?: number | null
+}): ScoreExplanation {
+  const totalScore = Math.max(1, Math.min(100, Math.round(input.score || 85)))
+  const currentYear = new Date().getFullYear()
+  const built = input.yearBuilt && input.yearBuilt > 1500 ? input.yearBuilt : null
+  const age = built ? Math.max(0, currentYear - built) : null
+  const agePoints = age !== null ? Math.min(25, Math.round(age / 2)) : 18
+  const units = typeof input.units === 'number' && input.units > 0 ? input.units : null
+  const isLowDensity = units === null || units <= 3
+
+  const matchedCategory = Object.values(OPPORTUNITY_CATEGORIES).find(
+    (c) => c.name.toLowerCase() === (input.category || '').toLowerCase()
+  )
+  const categoryScore = matchedCategory?.defaultScore || totalScore
+
+  const tier =
+    totalScore >= 90
+      ? 'Critical Priority (90–100)'
+      : totalScore >= 80
+        ? 'High Likelihood to Sell (80–89)'
+        : 'Emerging Watch (65–79)'
+
+  const tierColor =
+    totalScore >= 90
+      ? 'bg-rose-50 text-rose-800 border-rose-200'
+      : totalScore >= 80
+        ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+        : 'bg-amber-50 text-amber-800 border-amber-200'
+
+  const triggerLabel = matchedCategory ? matchedCategory.name : input.category || 'Off-Market Distress Signal'
+
+  const summary =
+    totalScore >= 90
+      ? `Scored ${totalScore}/100 because public registries flag an urgent "${triggerLabel}" timeline paired with ${
+          isLowDensity ? 'direct-decision low-density ownership' : 'elevated carrying complexity'
+        }, putting this parcel in our highest off-market sale probability tier.`
+      : `Scored ${totalScore}/100 from the combination of "${triggerLabel}" indicators, NYC PLUTO building vintage, and ${
+          isLowDensity ? 'flexible small-parcel ownership' : 'multi-unit holding overhead'
+        }.`
+
+  const equityDetail =
+    input.estimatedEquityPercent !== null && input.estimatedEquityPercent !== undefined
+      ? `DOF valuation shows ~${input.estimatedEquityPercent}% estimated net equity${
+          input.taxLiensCount ? ` alongside ${input.taxLiensCount} active municipal lien filing(s)` : ''
+        }, giving the owner equity room to exit off-market without a short-sale deficiency.`
+      : `Calculated by comparing NYC DOF market valuations against ACRIS recorded mortgages and DOF tax-lien rolls to ensure viable off-market deal spread.`
+
+  const factors: ScoreFactor[] = [
+    {
+      label: `Distress Catalyst: ${triggerLabel}`,
+      weight: `${categoryScore}/100 category tier`,
+      impact: categoryScore >= 89 ? 'High' : 'Moderate',
+      detail:
+        input.reason ||
+        matchedCategory?.description ||
+        'Matched against active municipal legal, tax-lien, and violation filings in NYC public registries.',
+    },
+    {
+      label: built ? `Building Age & Hold Cycle (Built ${built})` : 'Building Vintage & Hold Duration',
+      weight: `+${agePoints} PLUTO age pts (+8 stagnation)`,
+      impact: agePoints >= 18 ? 'High' : 'Moderate',
+      detail: built
+        ? `At ${age} years old, this structure approaches peak cap-ex/deferred-maintenance age (+${agePoints} pts out of 25 max) where long-term owners frequently prefer an as-is off-market buyer.`
+        : 'Long-held pre-war or mid-century NYC stock without recent major DOB alterations receives up to +33 structural PLUTO points.',
+    },
+    {
+      label: units ? `Density & Decision Structure (${units} unit${units === 1 ? '' : 's'})` : 'Low-Density Ownership Profile',
+      weight: isLowDensity ? '+12 pts (1–3 units)' : '+5 pts (4+ units)',
+      impact: isLowDensity ? 'High' : 'Supporting',
+      detail: isLowDensity
+        ? '1–3 family properties receive the full +12 ownership agility bonus because decisions come directly from individuals, families, or estate representatives rather than boards.'
+        : `Multi-unit building (${units} units) carries heavier compliance/HPD upkeep pressure, earning +5 density points.`,
+    },
+    {
+      label: 'Equity Cushion & Debt Ratio',
+      weight: 'Financial viability check',
+      impact:
+        input.estimatedEquityPercent !== null && input.estimatedEquityPercent !== undefined && input.estimatedEquityPercent >= 40
+          ? 'High'
+          : 'Moderate',
+      detail: equityDetail,
+    },
+  ]
+
+  const systemPillars = [
+    {
+      title: '1. Public Filing & Timeline Urgency',
+      maxPoints: '81–96 tier rank',
+      description:
+        'Each property is classified across 8 NYC distress signals ranked by legal deadline urgency: Foreclosure Auctions (96), Tax-Delinquent Liens (94), Pre-Foreclosures (92), Estate/Probate (89), Short Sales (87), Bank-Owned REO (86), Vacant/HPD (84), and Expired Listings (81).',
+    },
+    {
+      title: '2. PLUTO Structural Baseline',
+      maxPoints: 'Up to 90 base pts',
+      description:
+        'Parcel telemetry starts at 45 base points and adds up to +25 for building age (age ÷ 2), +12 for agile 1–3 unit properties (+5 for larger), and +8 when no major alterations were filed in the last 10 years.',
+    },
+    {
+      title: '3. Financial & Lien Validation',
+      maxPoints: 'DOF + ACRIS check',
+      description:
+        'Cross-references NYC DOF market assessments against ACRIS mortgages and tax-lien sale notices so high distress scores stay anchored to real equity.',
+    },
+  ]
+
+  return {
+    totalScore,
+    tier,
+    tierColor,
+    summary,
+    factors,
+    systemPillars,
+  }
+}
+
 export interface MotivationClassification {
   category: string
   categoryNumber: number
