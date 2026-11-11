@@ -1,47 +1,66 @@
-import { createClient } from "@supabase/supabase-js";
-import { NextResponse } from "next/server";
+import { NextResponse } from 'next/server'
+import {
+  getSupabaseServerClient,
+  requireAuth,
+  SupabaseConfigurationError,
+} from '@/lib/auth'
+import { leadSubmissionSchema } from '@/lib/lead-schema'
 
-import { leadSubmissionSchema } from "@/lib/lead-schema";
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
 
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
+export async function GET() {
+  let auth
+  try {
+    auth = await requireAuth()
+  } catch (error) {
+    if (error instanceof SupabaseConfigurationError) {
+      return NextResponse.json({ error: error.message }, { status: 503 })
+    }
+    throw error
+  }
+  if (auth.response) return auth.response
+
+  const { data: leads, error } = await auth.supabase
+    .from('marketplace_leads')
+    .select('*')
+    .order('created_at', { ascending: false })
+
+  if (error) {
+    console.error('Workspace leads query failed', { code: error.code, message: error.message })
+    return NextResponse.json({ error: 'We could not load workspace leads.' }, { status: 500 })
+  }
+
+  return NextResponse.json({ success: true, leads })
+}
 
 export async function POST(request: Request) {
-  let body: unknown;
+  let body: unknown
   try {
-    body = await request.json();
+    body = await request.json()
   } catch {
-    return NextResponse.json({ error: "Invalid request" }, { status: 400 });
+    return NextResponse.json({ error: 'Invalid request' }, { status: 400 })
   }
 
-  const parsed = leadSubmissionSchema.safeParse(body);
+  const parsed = leadSubmissionSchema.safeParse(body)
   if (!parsed.success) {
-    return NextResponse.json({ error: "Please check the form and try again." }, { status: 400 });
+    return NextResponse.json({ error: 'Please check the form and try again.' }, { status: 400 })
   }
 
-  // Silently accept bot submissions without writing anything.
   if (parsed.data.website) {
-    return NextResponse.json({ ok: true });
+    return NextResponse.json({ ok: true })
   }
 
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-
-  if (!supabaseUrl || !supabaseAnonKey) {
-    if (process.env.NODE_ENV !== "production") {
-      return NextResponse.json({ ok: true, demo: true });
+  let supabase
+  try {
+    supabase = await getSupabaseServerClient()
+  } catch (error) {
+    if (error instanceof SupabaseConfigurationError) {
+      return NextResponse.json({ error: error.message }, { status: 503 })
     }
-    return NextResponse.json({ error: "Lead capture is not configured." }, { status: 503 });
+    throw error
   }
-
-  const supabase = createClient(supabaseUrl, supabaseAnonKey, {
-    auth: {
-      autoRefreshToken: false,
-      persistSession: false,
-    },
-  });
-
-  const lead = parsed.data;
+  const lead = parsed.data
   const { error } = await supabase.from("leads").insert({
     full_name: lead.fullName,
     email: lead.email,
@@ -63,12 +82,12 @@ export async function POST(request: Request) {
     },
     motivation: lead.motivation || null,
     urgency_score: lead.urgencyScore,
-  });
+  })
 
   if (error) {
-    console.error("Lead insert failed", { code: error.code, message: error.message });
-    return NextResponse.json({ error: "We could not save your request. Please try again." }, { status: 500 });
+    console.error('Lead insert failed', { code: error.code, message: error.message })
+    return NextResponse.json({ error: 'We could not save your request. Please try again.' }, { status: 500 })
   }
 
-  return NextResponse.json({ ok: true }, { status: 201 });
+  return NextResponse.json({ ok: true }, { status: 201 })
 }

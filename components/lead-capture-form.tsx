@@ -7,6 +7,9 @@ import {
   ArrowRight,
   Check,
   CheckCircle2,
+  Clock3,
+  Home,
+  Layers3,
   Loader2,
   LockKeyhole,
   ShieldCheck,
@@ -427,7 +430,7 @@ export function LeadCaptureForm() {
           ) : null}
           <div className="mt-8 flex flex-col justify-center gap-3 sm:flex-row">
             <Button asChild>
-              <Link href="/">Return to MoveSmart</Link>
+              <Link href="/">Return to LeadFlow NYC</Link>
             </Button>
             <Button variant="outline" onClick={() => { setSubmitted(false); setCurrentStep(0); setForm(initialForm); }}>
               Start another check
@@ -442,7 +445,7 @@ export function LeadCaptureForm() {
   if (submitted) return renderSuccess();
 
   return (
-    <div className="mx-auto max-w-4xl">
+    <div className="mx-auto max-w-5xl">
       <div className="mb-8 flex flex-col gap-5 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <p className="text-sm font-bold uppercase tracking-[0.2em] text-accent">Private home move check</p>
@@ -454,7 +457,19 @@ export function LeadCaptureForm() {
           Private by default
         </div>
       </div>
-      <Card className="overflow-hidden border-border/80 bg-white/90 shadow-card">
+      <div className="mb-6 grid gap-3 sm:grid-cols-3">
+        {[
+          { icon: Home, label: "Property", value: form.streetAddress || "Add your address" },
+          { icon: Layers3, label: "Move profile", value: form.isBuyingNextHome === null ? "Not chosen" : form.isBuyingNextHome ? "Sell + buy" : "Sell only" },
+          { icon: Clock3, label: "Timeline", value: form.timeline ? timelineOptions.find((option) => option.value === form.timeline)?.label ?? "Set" : "Not set" },
+        ].map(({ icon: Icon, label, value }) => (
+          <div key={label} className="flex items-center gap-3 rounded-2xl border border-[#10243b]/10 bg-white px-4 py-3 shadow-soft">
+            <div className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-[#fff2ee] text-coral-500"><Icon className="size-4" /></div>
+            <div className="min-w-0"><p className="text-[10px] font-black uppercase tracking-[0.16em] text-[#8a98a4]">{label}</p><p className="mt-0.5 truncate text-sm font-black text-[#10243b]">{value}</p></div>
+          </div>
+        ))}
+      </div>
+      <Card className="overflow-hidden rounded-[1.75rem] border-[#10243b]/10 bg-white shadow-lift">
         <CardHeader className="border-b border-border/70 bg-muted/25 pb-5">
           <div className="flex items-center justify-between gap-4">
             <div>
