@@ -1,6 +1,7 @@
 {
-  "name": "real-estate",
+  "name": "lead-flow",
   "version": "0.1.0",
+  "description": "Off-market NYC real estate intelligence platform for real estate wholesalers and off-market agents — combining live ACRIS deeds, DOF valuations & tax liens, 0-100 scoring, DNC-scrubbed owner lookups, and full property report PDFs.",
   "private": true,
   "scripts": {
     "dev": "next dev",

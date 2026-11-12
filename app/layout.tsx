@@ -4,10 +4,10 @@ import { cn } from '@/lib/utils'
 
 export const metadata: Metadata = {
   title: {
-    default: 'LeadFlow NYC | Off-Market Deal Intelligence for Agents & Wholesalers',
+    default: 'LeadFlow NYC | Off-Market Intelligence for Wholesalers & Agents',
     template: '%s | LeadFlow NYC',
   },
-  description: 'Forensic property intelligence, pre-foreclosure alerts, verified equity spreads, and public deed records for New York City acquisition agents and wholesalers.',
+  description: 'Off-market NYC property intelligence built for real estate wholesalers and off-market agents: live ACRIS deeds & mortgages, DOF tax liens & valuations, 0-100 scoring, DNC-scrubbed owner lookups, and full property report PDFs.',
   icons: {
     icon: '/favicon.ico',
   },
