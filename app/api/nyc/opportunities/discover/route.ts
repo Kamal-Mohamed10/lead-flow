@@ -8,6 +8,7 @@ interface DiscoveryRequest {
   excludedBbls?: unknown
   limit?: unknown
   boroughs?: unknown
+  prioritize?: unknown
 }
 
 export async function POST(request: Request) {
@@ -27,8 +28,17 @@ export async function POST(request: Request) {
       : []
     const requestedLimit =
       typeof body.limit === 'number' && Number.isFinite(body.limit) ? body.limit : 10
-    const signals = await fetchLiveNYCSignals(excludedBbls, requestedLimit, boroughs)
+    const safeLimit = Math.min(Math.max(Math.floor(requestedLimit), 1), 50)
+    const prioritize = body.prioritize === true
+    // Pool up to 1.4x candidates (capped at 30) when prioritizing so the queue receives top scores quickly
+    const candidateLimit = prioritize ? Math.min(30, Math.max(safeLimit, Math.round(safeLimit * 1.4))) : safeLimit
+    const signals = await fetchLiveNYCSignals(excludedBbls, candidateLimit, boroughs)
+    const currentYear = new Date().getFullYear()
     const opportunities = signals.map((signal) => {
+      const units = Number(signal.buildingDetails.unitsres || signal.buildingDetails.unitstotal || 0)
+      const yearBuilt = Number(signal.buildingDetails.yearbuilt || 0) || null
+      const alteredYear = Number(signal.buildingDetails.yearalter1 || 0)
+      const recentAlteration = alteredYear > 0 ? alteredYear >= currentYear - 10 : null
       const classification = classifyOpportunity({
         documentType: signal.documentType,
         signals: [
@@ -39,6 +49,9 @@ export async function POST(request: Request) {
         ownerName: signal.ownerName,
         address: signal.address,
         bbl: signal.bbl,
+        yearBuilt,
+        units,
+        recentAlteration,
       })
 
       return {
@@ -49,8 +62,8 @@ export async function POST(request: Request) {
         zip: signal.zipCode || '',
         block: signal.block,
         lot: signal.lot,
-        units: Number(signal.buildingDetails.unitsres || signal.buildingDetails.unitstotal || 0),
-        yearBuilt: Number(signal.buildingDetails.yearbuilt || 0) || null,
+        units,
+        yearBuilt,
         buildingClass: signal.propertyType,
         score: classification.score,
         category: classification.category,
@@ -74,15 +87,18 @@ export async function POST(request: Request) {
       }
     })
 
+    opportunities.sort((a, b) => b.score - a.score)
+    const finalOpportunities = prioritize ? opportunities.slice(0, safeLimit) : opportunities
+
     return NextResponse.json({
       success: true,
       source: 'NYC Open Data',
       fetchedAt: new Date().toISOString(),
-      count: opportunities.length,
-      message: opportunities.length
+      count: finalOpportunities.length,
+      message: finalOpportunities.length
         ? null
         : 'No unseen properties were found in this live sample. Refresh to search another batch.',
-      opportunities,
+      opportunities: finalOpportunities,
     })
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown discovery error'

@@ -63,6 +63,7 @@ export async function POST(request: Request) {
       bbl: string
       propertyId: string
       opportunityId: string
+      score: number
       enriched: Awaited<ReturnType<typeof enrichPropertyOpportunity>>
       address: string
       borough: string
@@ -84,8 +85,13 @@ export async function POST(request: Request) {
       badgeBorder: string
     }> = []
 
+    const currentYear = new Date().getFullYear()
     for (const signal of signals) {
       const enriched = await enrichPropertyOpportunity(signal)
+      const units = Number(signal.buildingDetails.unitsres || signal.buildingDetails.unitstotal || 0)
+      const yearBuilt = Number(signal.buildingDetails.yearbuilt || 0) || null
+      const alteredYear = Number(signal.buildingDetails.yearalter1 || 0)
+      const recentAlteration = alteredYear > 0 ? alteredYear >= currentYear - 10 : null
       const classification = classifyOpportunity({
         documentType: signal.documentType,
         signals: [
@@ -96,6 +102,9 @@ export async function POST(request: Request) {
         ownerName: signal.ownerName,
         address: signal.address,
         bbl: signal.bbl,
+        yearBuilt,
+        units,
+        recentAlteration,
       })
 
       const { data: claim, error: claimError } = await admin
@@ -138,6 +147,7 @@ export async function POST(request: Request) {
         bbl: signal.bbl,
         propertyId: saved.property_id,
         opportunityId: saved.opportunity_id,
+        score: classification.score || enriched.opportunityScore,
         enriched,
         address: signal.address,
         borough: signal.borough,
@@ -164,6 +174,8 @@ export async function POST(request: Request) {
         ].filter((item): item is string => Boolean(item)),
       })
     }
+
+    processedResults.sort((a, b) => b.score - a.score)
 
     return NextResponse.json({
       success: true,

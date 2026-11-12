@@ -65,12 +65,19 @@ export function GlobalAiAssistant() {
     setInput('')
     setLoading(true)
 
-    // Gather all local properties from CRM + delivered feed + cache
+    // Gather all local properties from Watchlist + Explore catalog + cache
     let allProperties: AssistantProperty[] = []
     let currentProp: AssistantProperty | null = null
     try {
       const crmLeads = JSON.parse(localStorage.getItem('leadflow-crm-leads') || '[]')
-      allProperties = [...crmLeads]
+      const exploredLeads = JSON.parse(localStorage.getItem('leadflow-explored-catalog') || '[]')
+      const combined = [...(Array.isArray(crmLeads) ? crmLeads : []), ...(Array.isArray(exploredLeads) ? exploredLeads : [])]
+      const seen = new Set<string>()
+      allProperties = combined.filter((item) => {
+        if (!item?.id || seen.has(item.id)) return false
+        seen.add(item.id)
+        return true
+      })
 
       // Extract specific property if on a property page
       if (pathname.includes('/dashboard/properties/')) {
@@ -189,12 +196,12 @@ export function GlobalAiAssistant() {
         <button
           onClick={() => setIsOpen(true)}
           className="fixed bottom-5 right-5 z-50 flex items-center gap-2 rounded-full bg-[#172b2a] px-3.5 py-2.5 text-white shadow-lg transition-transform hover:scale-105 active:scale-95"
-          aria-label="Open AI Copilot"
+          aria-label="Open Property Copilot"
         >
           <div className="flex size-6 items-center justify-center rounded-full bg-[#176b4d] text-white">
             <Sparkles className="size-3.5" />
           </div>
-          <span className="text-xs font-bold tracking-tight">AI Copilot</span>
+          <span className="text-xs font-bold tracking-tight">Property Copilot</span>
         </button>
       )}
 
@@ -202,7 +209,7 @@ export function GlobalAiAssistant() {
       {isOpen && (
         <aside
           role="complementary"
-          aria-label="LeadFlow AI Copilot"
+          aria-label="LeadFlow Copilot"
           className="fixed bottom-5 right-5 z-50 flex h-[520px] w-[370px] max-w-[calc(100vw-32px)] flex-col rounded-2xl border border-slate-200 bg-white shadow-2xl overflow-hidden animate-in fade-in slide-in-from-bottom-2 duration-150"
         >
           {/* Header */}
@@ -211,7 +218,7 @@ export function GlobalAiAssistant() {
               <div className="grid size-6 place-items-center rounded-lg bg-[#176b4d] text-white">
                 <Sparkles className="size-3.5" />
               </div>
-              <p className="text-xs font-black tracking-wide">LeadFlow AI Copilot</p>
+              <p className="text-xs font-black tracking-wide">LeadFlow Copilot</p>
             </div>
 
             <button

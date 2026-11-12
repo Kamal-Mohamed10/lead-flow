@@ -20,6 +20,18 @@ import {
   Trash2,
   X,
 } from 'lucide-react'
+import { explainPropertyScore } from '@/lib/motivationClassifier'
+import { fetchAndDownloadPropertyReportPdf } from '@/lib/propertyReportPdf'
+import { ScoreBreakdownPanel } from '@/components/score-breakdown-panel'
+import {
+  clearWatchlistStorage,
+  isActiveWatchlistLead,
+  readExploredCatalog,
+  readSavedLeads,
+  syncDealStatusToSavedLeads,
+  WATCHLIST_UPDATED_EVENT,
+  writeExploredCatalog,
+} from '@/lib/propertyStorage'
 
 export interface WatchlistLead {
   id: string
@@ -71,20 +83,13 @@ export default function WatchlistPage() {
   const [statusFilter, setStatusFilter] = useState<'all' | 'watchlist' | 'vault' | 'contacted' | 'contract'>('all')
   const [selectedProperty, setSelectedProperty] = useState<WatchlistLead | null>(null)
   const [generatingReport, setGeneratingReport] = useState(false)
+  const [reportError, setReportError] = useState<string | null>(null)
 
-  // Load watchlist items from localStorage
+  // Load watchlist items from localStorage (explicitly saved deals only)
   function loadWatchlist() {
     try {
-      const stored = JSON.parse(localStorage.getItem('leadflow-crm-leads') || '[]') as WatchlistLead[]
-      // Include any property marked as watchlist, vault, qualified, or with active negotiation
-      const activeWatchlist = stored.filter(
-        (lead) =>
-          lead.dealStatus === 'watchlist' ||
-          lead.dealStatus === 'vault' ||
-          lead.dealStatus === 'contacted' ||
-          lead.dealStatus === 'under_contract' ||
-          lead.stage === 'qualified'
-      )
+      const saved = readSavedLeads<WatchlistLead>()
+      const activeWatchlist = saved.filter(isActiveWatchlistLead)
       setWatchlist(activeWatchlist)
     } catch {
       setWatchlist([])
@@ -96,27 +101,46 @@ export default function WatchlistPage() {
   useEffect(() => {
     loadWatchlist()
     window.addEventListener('storage', loadWatchlist)
-    return () => window.removeEventListener('storage', loadWatchlist)
+    window.addEventListener(WATCHLIST_UPDATED_EVENT, loadWatchlist)
+    return () => {
+      window.removeEventListener('storage', loadWatchlist)
+      window.removeEventListener(WATCHLIST_UPDATED_EVENT, loadWatchlist)
+    }
   }, [])
 
   function updateStatus(id: string, newStatus: string) {
     try {
-      const stored = JSON.parse(localStorage.getItem('leadflow-crm-leads') || '[]') as WatchlistLead[]
-      let updated: WatchlistLead[]
-      if (newStatus === 'remove') {
-        updated = stored.filter((lead) => lead.id !== id)
-      } else {
-        updated = stored.map((lead) =>
-          lead.id === id ? { ...lead, dealStatus: newStatus as any, stage: newStatus === 'under_contract' ? 'under_contract' : lead.stage } : lead
+      const target = watchlist.find((lead) => lead.id === id) || readSavedLeads<WatchlistLead>().find((lead) => lead.id === id)
+      const normalizedStatus = newStatus === 'remove' ? undefined : newStatus
+      if (target) {
+        syncDealStatusToSavedLeads(target, normalizedStatus)
+      }
+      const catalog = readExploredCatalog<WatchlistLead>()
+      if (catalog.some((item) => item.id === id)) {
+        writeExploredCatalog(
+          catalog.map((item) =>
+            item.id === id
+              ? {
+                  ...item,
+                  dealStatus: normalizedStatus as WatchlistLead['dealStatus'],
+                  stage: normalizedStatus || 'explored',
+                }
+              : item
+          )
         )
       }
-      localStorage.setItem('leadflow-crm-leads', JSON.stringify(updated))
       loadWatchlist()
       if (selectedProperty?.id === id) {
         if (newStatus === 'remove') setSelectedProperty(null)
-        else setSelectedProperty((curr) => curr ? { ...curr, dealStatus: newStatus as any } : null)
+        else setSelectedProperty((curr) => (curr ? { ...curr, dealStatus: newStatus as any } : null))
       }
     } catch {}
+  }
+
+  function clearAllWatchlist() {
+    clearWatchlistStorage()
+    setSelectedProperty(null)
+    loadWatchlist()
   }
 
   const filteredWatchlist = useMemo(() => {
@@ -124,7 +148,7 @@ export default function WatchlistPage() {
       if (selectedBorough !== 'All' && lead.borough !== selectedBorough) return false
       if (selectedCategory !== 'All' && lead.category !== selectedCategory) return false
       if (statusFilter === 'vault' && lead.dealStatus !== 'vault') return false
-      if (statusFilter === 'watchlist' && lead.dealStatus !== 'watchlist' && lead.stage !== 'qualified') return false
+      if (statusFilter === 'watchlist' && lead.dealStatus !== 'watchlist' && !(!lead.dealStatus && lead.stage === 'watchlist')) return false
       if (statusFilter === 'contacted' && lead.dealStatus !== 'contacted') return false
       if (statusFilter === 'contract' && lead.dealStatus !== 'under_contract') return false
       if (searchQuery && !`${lead.address} ${lead.borough} ${lead.zip}`.toLowerCase().includes(searchQuery.toLowerCase())) {
@@ -136,64 +160,19 @@ export default function WatchlistPage() {
 
   async function downloadResearchBrief(property: WatchlistLead) {
     setGeneratingReport(true)
+    setReportError(null)
     try {
-      const { jsPDF } = await import('jspdf')
-      const doc = new jsPDF()
-      const pageWidth = doc.internal.pageSize.getWidth()
-      const margin = 18
-      let y = 18
-
-      const write = (text: string, size = 10, color: [number, number, number] = [51, 65, 85], bold = false) => {
-        doc.setFont('helvetica', bold ? 'bold' : 'normal')
-        doc.setFontSize(size)
-        doc.setTextColor(...color)
-        const lines = doc.splitTextToSize(text, pageWidth - margin * 2) as string[]
-        for (const line of lines) {
-          if (y > 278) {
-            doc.addPage()
-            y = 18
-          }
-          doc.text(line, margin, y)
-          y += size * 0.42
-        }
-      }
-
-      const section = (title: string) => {
-        y += 5
-        write(title, 12, [23, 107, 77], true)
-        y += 2
-      }
-
-      doc.setFillColor(23, 43, 42)
-      doc.rect(0, 0, pageWidth, 34, 'F')
-      doc.setTextColor(255, 255, 255)
-      doc.setFont('helvetica', 'bold')
-      doc.setFontSize(19)
-      doc.text('LeadFlow Watchlist Research Report', margin, 21)
-      y = 43
-      write(property.address, 15, [23, 43, 42], true)
-      write(`${property.borough}${property.zip ? `, NY ${property.zip}` : ', New York'}`, 10)
-      write(`Research Date: ${new Date().toLocaleDateString()}`, 8, [100, 116, 139])
-
-      if (property.category) {
-        section('Distress Signal & Rationale')
-        write(`Category: ${property.category} (${property.subheadline || 'High Urgency'})`, 10, [15, 23, 42], true)
-        if (property.reason) write(`Why it surfaced: ${property.reason}`, 9)
-        if (property.opportunityAngle) write(`Strategic Pitch Angle: ${property.opportunityAngle}`, 9)
-      }
-
-      section('Forensic Equity Breakdown')
-      const score = property.score || 85
-      const estEquity = Math.round(score * 6300)
-      write('Assessed DOF Value: ~$850,000')
-      write('Recorded Liens/Debt: ~$320,000')
-      write(`Net Estimated Equity Cushion: ~$${estEquity.toLocaleString()} (62% Spread)`, 10, [23, 107, 77], true)
-
-      section('Public Record Sources')
-      write('Cross-referenced with NYC PLUTO, ACRIS Real Property Legals, and DOF Property Valuation tax records.', 9)
-
-      const safeAddress = property.address.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').slice(0, 60).toLowerCase()
-      doc.save(`${safeAddress || 'property'}-watchlist-report.pdf`)
+      const statusLabel = property.dealStatus
+        ? property.dealStatus.replace('_', ' ')
+        : 'Watchlist'
+      await fetchAndDownloadPropertyReportPdf({
+        property,
+        statusLabel,
+      })
+    } catch (error) {
+      setReportError(
+        error instanceof Error ? error.message : 'Unable to generate Property Report PDF.'
+      )
     } finally {
       setGeneratingReport(false)
     }
@@ -211,11 +190,21 @@ export default function WatchlistPage() {
             Watchlist
           </h1>
           <p className="mt-1 text-sm text-slate-500">
-            Your shortlisted off-market properties queued for deep title research, Find Owner lookups, and AI Agent Notes.
+            Your shortlisted off-market properties queued for deep title research, Find Owner lookups, and Agent Notes.
           </p>
         </div>
 
-        <div className="flex items-center gap-2.5">
+        <div className="flex flex-wrap items-center gap-2.5">
+          {watchlist.length > 0 && (
+            <button
+              type="button"
+              onClick={clearAllWatchlist}
+              className="flex items-center gap-1.5 rounded-xl border border-rose-200 bg-rose-50/80 px-4 py-2.5 text-xs font-bold text-rose-700 shadow-xs hover:bg-rose-100 transition"
+            >
+              <Trash2 className="size-3.5" />
+              <span>Clear Watchlist</span>
+            </button>
+          )}
           <Link
             href="/dashboard/leads"
             className="flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-xs font-bold text-[#172b2a] shadow-xs hover:bg-slate-50 transition"
@@ -285,7 +274,7 @@ export default function WatchlistPage() {
         <div className="flex flex-wrap items-center gap-1.5 border-t border-slate-100 pt-3">
           {[
             { id: 'all', label: 'All Saved', count: watchlist.length },
-            { id: 'watchlist', label: 'Watchlist', count: watchlist.filter((l) => l.dealStatus === 'watchlist' || l.stage === 'qualified').length },
+            { id: 'watchlist', label: 'Watchlist', count: watchlist.filter((l) => l.dealStatus === 'watchlist' || (!l.dealStatus && l.stage === 'watchlist')).length },
             { id: 'vault', label: '🔒 Saved Vault', count: watchlist.filter((l) => l.dealStatus === 'vault').length },
             { id: 'contacted', label: 'Contacted', count: watchlist.filter((l) => l.dealStatus === 'contacted').length },
             { id: 'contract', label: 'Under Contract', count: watchlist.filter((l) => l.dealStatus === 'under_contract').length },
@@ -347,7 +336,12 @@ export default function WatchlistPage() {
         <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-3">
           {filteredWatchlist.map((lead) => {
             const photoSrc = getPhotoForProperty(lead.id)
-            const score = lead.score || 85
+            const score = explainPropertyScore({
+              category: lead.category,
+              reason: lead.reason,
+              yearBuilt: lead.yearBuilt,
+              units: lead.units,
+            }).totalScore
             const equitySpread = Math.round(score * 6300)
 
             return (
@@ -520,7 +514,12 @@ export default function WatchlistPage() {
                   </p>
                 </div>
                 <span className="rounded-md bg-[#176b4d] px-2.5 py-1 text-xs font-bold text-white">
-                  Score {selectedProperty.score || 85}
+                  Score {explainPropertyScore({
+                    category: selectedProperty.category,
+                    reason: selectedProperty.reason,
+                    yearBuilt: selectedProperty.yearBuilt,
+                    units: selectedProperty.units,
+                  }).totalScore}/100
                 </span>
               </div>
             </div>
@@ -546,6 +545,20 @@ export default function WatchlistPage() {
                 </div>
               )}
 
+              {/* Compact Scoring Confidence Breakdown */}
+              <div className="rounded-2xl border border-slate-200/80 bg-white p-4">
+                <ScoreBreakdownPanel
+                  breakdown={explainPropertyScore({
+                    category: selectedProperty.category,
+                    reason: selectedProperty.reason,
+                    yearBuilt: selectedProperty.yearBuilt,
+                    units: selectedProperty.units,
+                  })}
+                  compact
+                  scrollBodyClassName="max-h-[250px] overflow-y-auto [scrollbar-width:thin] [scrollbar-color:#cbd5e1_transparent]"
+                />
+              </div>
+
               {/* Research Link to Full Report */}
               <Link
                 href={`/dashboard/properties/${encodeURIComponent(selectedProperty.id)}`}
@@ -561,8 +574,13 @@ export default function WatchlistPage() {
                 className="flex w-full items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white py-3 text-xs font-bold text-slate-700 hover:bg-slate-50 transition shadow-xs disabled:opacity-50"
               >
                 <Download className={`size-3.5 ${generatingReport ? 'animate-bounce' : ''}`} />
-                <span>{generatingReport ? 'Generating Report...' : 'Download Watchlist Research PDF'}</span>
+                <span>{generatingReport ? 'Preparing Full PDF...' : 'Download Full Property Report PDF'}</span>
               </button>
+              {reportError && (
+                <p role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-800">
+                  {reportError}
+                </p>
+              )}
 
               {/* Remove from watchlist */}
               <button

@@ -415,7 +415,7 @@ export default function HomePage() {
               Start Finding Off-Market NYC Deals Today.
             </h2>
             <p className="text-base text-slate-300 leading-relaxed">
-              Launch your acquisition feed, inspect forensic title records, compute net equity spreads, and generate customized direct mail letters in seconds.
+              Launch your acquisition feed, inspect forensic title records, compute net equity spreads, and research verified owner details in seconds.
             </p>
 
             <div className="pt-4 flex flex-col sm:flex-row gap-3">

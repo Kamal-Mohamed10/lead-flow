@@ -20,11 +20,22 @@ import {
   RefreshCw,
   Search,
   ShieldCheck,
-  Sparkles,
   X,
 } from 'lucide-react'
-import { classifyOpportunity } from '@/lib/motivationClassifier'
+import { classifyOpportunity, explainPropertyScore } from '@/lib/motivationClassifier'
 import { InteractiveGeoMap } from '@/components/interactive-geo-map'
+import { LeadFlowLoader } from '@/components/leadflow-loader'
+import { ScoreBreakdownPanel } from '@/components/score-breakdown-panel'
+import { fetchAndDownloadPropertyReportPdf, type FinancialSummary } from '@/lib/propertyReportPdf'
+import {
+  CRM_LEADS_KEY,
+  isSavedPipelineLead,
+  readExploredCatalog,
+  readSavedLeads,
+  syncDealStatusToSavedLeads,
+  WATCHLIST_UPDATED_EVENT,
+  writeExploredCatalog,
+} from '@/lib/propertyStorage'
 
 export type DealStatus = 'watchlist' | 'vault' | 'contacted' | 'under_contract' | 'closed' | 'archived'
 
@@ -109,6 +120,7 @@ type ResearchFinding = {
 interface PropertyResearch {
   bbl: string
   researchedAt: string
+  financials?: FinancialSummary | null
   findings: {
     equity: ResearchFinding
     financial: ResearchFinding
@@ -208,8 +220,8 @@ export default function LeadsPage() {
   const [enrichment, setEnrichment] = useState<Enrichment | null>(null)
   const [enriching, setEnriching] = useState(false)
   const [generatingReport, setGeneratingReport] = useState(false)
+  const [reportError, setReportError] = useState<string | null>(null)
   const [aiBrief, setAiBrief] = useState<AiBrief | null>(null)
-  const [generatingBrief, setGeneratingBrief] = useState(false)
   const [searchingAddress, setSearchingAddress] = useState(false)
   const [addressResults, setAddressResults] = useState<any[]>([])
   const [addressSearched, setAddressSearched] = useState(false)
@@ -234,14 +246,10 @@ export default function LeadsPage() {
       } catch {
         territoryPreferences = territory
       }
-      let savedLeads: Lead[] = []
-      try {
-        savedLeads = JSON.parse(localStorage.getItem('leadflow-crm-leads') || '[]')
-      } catch {
-        savedLeads = leads
-      }
+      const savedLeads = readSavedLeads<Lead>()
+      const exploredLeads = readExploredCatalog<Lead>()
 
-      const currentBbls = [...leads, ...savedLeads]
+      const currentBbls = [...leads, ...exploredLeads, ...savedLeads]
         .map((lead) => lead.id)
         .filter((id) => /^[1-5]\d{9}$/.test(id))
       const response = demoMode
@@ -271,6 +279,8 @@ export default function LeadsPage() {
       }
       const agentName = localStorage.getItem('leadflow-user-name') || 'You'
       const delivered = incoming.map((item: any) => {
+        const units = item.units || 1
+        const yearBuilt = item.yearBuilt || 1930
         const classification = classifyOpportunity({
           documentType: item.documentType,
           signals: item.signals,
@@ -278,6 +288,8 @@ export default function LeadsPage() {
           ownerName: item.ownerName,
           address: item.address,
           bbl: item.id || item.bbl,
+          yearBuilt,
+          units,
         })
 
         return {
@@ -289,10 +301,10 @@ export default function LeadsPage() {
           lot: String(item.lot || ''),
           stage: 'explored',
           dealStatus: undefined,
-          units: item.units || 1,
-          yearBuilt: item.yearBuilt || 1930,
+          units,
+          yearBuilt,
           buildingClass: item.buildingClass || 'A1',
-          score: item.score || classification.score,
+          score: classification.score,
           category: item.category || classification.category,
           categoryNumber: item.categoryNumber || classification.categoryNumber,
           subheadline: item.subheadline || classification.subheadline,
@@ -310,21 +322,27 @@ export default function LeadsPage() {
         }
       }) as Lead[]
 
+      const savedStatusMap = new Map(readSavedLeads<Lead>().map((lead) => [lead.id, lead.dealStatus]))
       setLeads((current) => {
-        const existingStatus = new Map(current.map((lead) => [lead.id, lead.dealStatus]))
+        const existingStatus = new Map(current.map((lead) => [lead.id, savedStatusMap.get(lead.id) ?? lead.dealStatus]))
         const previousDelivered = JSON.parse(localStorage.getItem('leadflow-delivered-opportunity-ids') || '[]') as string[]
         const additions = delivered.filter((lead) => !existingStatus.has(lead.id) || !previousDelivered.includes(lead.id))
         localStorage.setItem('leadflow-delivered-opportunity-ids', JSON.stringify(delivered.map((lead) => lead.id)))
 
-        // Merge delivered items while preserving statuses (Vault, Contacted, Under Contract)
+        // Merge delivered items while preserving explicit user statuses (Vault, Watchlist, Contacted, Under Contract, Archived)
         const refreshed = delivered.map((lead) =>
           existingStatus.has(lead.id)
             ? { ...lead, dealStatus: existingStatus.get(lead.id) }
             : lead
         )
 
-        // Ensure any existing properties (especially Vault and Contacted items) are permanently preserved
-        const existingPreserved = current.filter((lead) => !delivered.some((item) => item.id === lead.id))
+        // Ensure existing explored/saved properties remain preserved in the Explore catalog
+        const existingPreserved = current
+          .filter((lead) => !delivered.some((item) => item.id === lead.id))
+          .map((lead) => ({
+            ...lead,
+            dealStatus: savedStatusMap.get(lead.id) ?? (lead.dealStatus === 'archived' ? 'archived' : undefined),
+          }))
         setNewCount(additions.length)
 
         const now = new Date()
@@ -355,19 +373,55 @@ export default function LeadsPage() {
     } catch {
       localStorage.removeItem('leadflow-agent-territory')
     }
-    const saved = localStorage.getItem('leadflow-crm-leads')
-    if (saved) {
-      try {
-        setLeads(JSON.parse(saved))
-      } catch {}
+    const existingCatalog = readExploredCatalog<Lead>()
+    const savedPipeline = readSavedLeads<Lead>()
+    let rawLegacy: Lead[] = []
+    try {
+      const parsed = JSON.parse(localStorage.getItem(CRM_LEADS_KEY) || '[]')
+      if (Array.isArray(parsed)) rawLegacy = parsed
+    } catch {}
+
+    // Migrate any un-saved explored items out of Watchlist storage ('leadflow-crm-leads') cleanly
+    if (rawLegacy.some((item) => !isSavedPipelineLead(item))) {
+      localStorage.setItem(CRM_LEADS_KEY, JSON.stringify(savedPipeline))
     }
-    refreshOpportunities(saved ? false : true)
+
+    const savedStatusMap = new Map(savedPipeline.map((lead) => [lead.id, lead.dealStatus]))
+    const initialCatalog = (existingCatalog.length ? existingCatalog : rawLegacy).map((lead) => ({
+      ...lead,
+      score: explainPropertyScore({
+        category: lead.category,
+        reason: lead.reason,
+        yearBuilt: lead.yearBuilt,
+        units: lead.units,
+      }).totalScore,
+      dealStatus: savedStatusMap.get(lead.id) ?? (lead.dealStatus === 'archived' ? 'archived' : undefined),
+    }))
+    if (initialCatalog.length) {
+      setLeads(initialCatalog)
+      if (!existingCatalog.length) writeExploredCatalog(initialCatalog)
+    }
+
+    refreshOpportunities(initialCatalog.length ? false : true)
+
+    const syncFromWatchlist = () => {
+      const latestSaved = readSavedLeads<Lead>()
+      const latestMap = new Map(latestSaved.map((lead) => [lead.id, lead.dealStatus]))
+      setLeads((curr) =>
+        curr.map((lead) => ({
+          ...lead,
+          dealStatus: latestMap.get(lead.id) ?? (lead.dealStatus === 'archived' ? 'archived' : undefined),
+        }))
+      )
+    }
+    window.addEventListener(WATCHLIST_UPDATED_EVENT, syncFromWatchlist)
+    return () => window.removeEventListener(WATCHLIST_UPDATED_EVENT, syncFromWatchlist)
     // eslint-disable-next-line react-hooks/exhaustive-hooks
   }, [])
 
   useEffect(() => {
     if (!loading && leads.length > 0) {
-      localStorage.setItem('leadflow-crm-leads', JSON.stringify(leads))
+      writeExploredCatalog(leads)
     }
   }, [leads, loading])
 
@@ -469,9 +523,17 @@ export default function LeadsPage() {
 
   function updateDealStatus(id: string, status: DealStatus | 'none') {
     const nextStatus = status === 'none' ? undefined : status
-    const updated = leads.map((lead) => (lead.id === id ? { ...lead, dealStatus: nextStatus } : lead))
+    let changedLead: Lead | null = null
+    const updated = leads.map((lead) => {
+      if (lead.id !== id) return lead
+      changedLead = { ...lead, dealStatus: nextStatus }
+      return changedLead
+    })
     setLeads(updated)
-    localStorage.setItem('leadflow-crm-leads', JSON.stringify(updated))
+    writeExploredCatalog(updated)
+    if (changedLead) {
+      syncDealStatusToSavedLeads(changedLead, nextStatus)
+    }
     if (selected?.id === id) {
       setSelected((curr) => (curr ? { ...curr, dealStatus: nextStatus } : null))
     }
@@ -506,8 +568,20 @@ export default function LeadsPage() {
     })
   }, [leads, query, territory, selectedCategory, activeTab])
 
+  const selectedBreakdown = useMemo(
+    () =>
+      selected
+        ? explainPropertyScore({
+            category: selected.category,
+            reason: selected.reason,
+            yearBuilt: selected.yearBuilt,
+            units: selected.units,
+          })
+        : null,
+    [selected]
+  )
+
   async function generateSellerBrief(lead: Lead, records: Enrichment | null) {
-    setGeneratingBrief(true)
     const ownerNames = [records?.ownerName, ...(records?.contacts.map((contact) => contact.name).filter(Boolean) || [])].filter((value, index, values): value is string => Boolean(value) && values.indexOf(value) === index)
     try {
       const response = await fetch('/api/ai/seller-brief', {
@@ -531,68 +605,32 @@ export default function LeadsPage() {
       if (!data.error) setAiBrief(data)
     } catch {
       setAiBrief(null)
-    } finally {
-      setGeneratingBrief(false)
     }
   }
 
   async function downloadSellerBrief() {
     if (!selected) return
     setGeneratingReport(true)
+    setReportError(null)
     try {
-      const { jsPDF } = await import('jspdf')
-      const doc = new jsPDF()
-      const pageWidth = doc.internal.pageSize.getWidth()
-      const margin = 18
-      let y = 18
-      const write = (text: string, size = 10, color: [number, number, number] = [51, 65, 85], bold = false) => {
-        doc.setFont('helvetica', bold ? 'bold' : 'normal')
-        doc.setFontSize(size)
-        doc.setTextColor(...color)
-        const lines = doc.splitTextToSize(text, pageWidth - margin * 2) as string[]
-        for (const line of lines) {
-          if (y > 278) {
-            doc.addPage()
-            y = 18
-          }
-          doc.text(line, margin, y)
-          y += size * 0.42
-        }
-      }
-      const section = (title: string) => {
-        y += 5
-        write(title, 12, [23, 107, 77], true)
-        y += 2
-      }
+      const existingResearch = propertyResearch[selected.id] || null
+      const existingContacts = contactResearch[selected.id] || null
+      const statusLabel = selected.dealStatus
+        ? selected.dealStatus.replace('_', ' ')
+        : selected.stage || 'Explored'
 
-      doc.setFillColor(23, 43, 42)
-      doc.rect(0, 0, pageWidth, 34, 'F')
-      doc.setTextColor(255, 255, 255)
-      doc.setFont('helvetica', 'bold')
-      doc.setFontSize(19)
-      doc.text('LeadFlow NYC Seller Research Brief', margin, 21)
-      y = 43
-      write(selected.address, 15, [23, 43, 42], true)
-      write(`${selected.borough}${selected.zip ? `, NY ${selected.zip}` : ', New York'}`, 10)
-      write(`Generated ${new Date().toLocaleString()}`, 8, [100, 116, 139])
-
-      if (selected.category) {
-        section('Distress Category & Motivation Angle')
-        write(`Category: ${selected.category}`, 10, [15, 23, 42], true)
-        if (selected.reason) write(`Why it surfaced: ${selected.reason}`, 9)
-        if (selected.opportunityAngle) write(`Recommended pitch angle: ${selected.opportunityAngle}`, 9)
-      }
-
-      section('Forensic Equity Breakdown')
-      write('Assessed NYC DOF Market Value: ~$850,000')
-      write('Recorded Mortgage & Municipal Liens: ~$320,000')
-      write('Calculated Owner Equity Spread: ~$530,000 (62% Equity Cushion)', 10, [23, 107, 77], true)
-
-      section('AI Strategic Summary')
-      write(aiBrief?.summary || 'High priority off-market prospect with substantial equity spread.', 10)
-
-      const safeAddress = selected.address.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').slice(0, 60).toLowerCase()
-      doc.save(`${safeAddress || 'property'}-seller-report.pdf`)
+      await fetchAndDownloadPropertyReportPdf({
+        property: selected,
+        statusLabel,
+        researchData: existingResearch,
+        contactData: existingContacts,
+        financials: existingResearch?.financials ?? null,
+        strategicSummary: aiBrief?.summary ?? null,
+      })
+    } catch (error) {
+      setReportError(
+        error instanceof Error ? error.message : 'Unable to generate Property Report PDF.'
+      )
     } finally {
       setGeneratingReport(false)
     }
@@ -614,6 +652,15 @@ export default function LeadsPage() {
   }
 
   function addResearchedProperty(property: any) {
+    const units = property.units || 1
+    const yearBuilt = property.yearBuilt || 1930
+    const classification = classifyOpportunity({
+      address: property.address,
+      bbl: String(property.id),
+      signals: property.signals,
+      yearBuilt,
+      units,
+    })
     const lead: Lead = {
       id: String(property.id),
       address: property.address,
@@ -623,10 +670,18 @@ export default function LeadsPage() {
       lot: String(property.lot || ''),
       stage: 'explored',
       dealStatus: undefined,
-      units: property.units || 1,
-      yearBuilt: property.yearBuilt || 1930,
+      units,
+      yearBuilt,
       buildingClass: property.buildingClass || 'A1',
-      score: property.score || 85,
+      score: classification.score,
+      category: classification.category,
+      categoryNumber: classification.categoryNumber,
+      subheadline: classification.subheadline,
+      reason: classification.reason,
+      opportunityAngle: classification.opportunityAngle,
+      badgeBg: classification.badgeBg,
+      badgeText: classification.badgeText,
+      badgeBorder: classification.badgeBorder,
       signals: property.signals || ['NYC municipal records verified'],
       source: 'NYC Open Data — Researched Parcel',
     }
@@ -912,7 +967,7 @@ export default function LeadsPage() {
             <div className="flex items-center justify-between px-1">
               <h2 className="flex items-center gap-2 font-serif text-lg font-bold italic text-[#172b2a]">
                 <MapPin className="size-4 text-[#176b4d]" />
-                Interactive NYC Geographic Deal Map
+                NYC Geographic Deal Map
               </h2>
               <span className="text-[11px] text-slate-500">
                 Hover over pins to preview building photos and equity spreads. Click to inspect property report.
@@ -940,7 +995,9 @@ export default function LeadsPage() {
               </h2>
             </div>
 
-            {filtered.length === 0 ? (
+            {loading && filtered.length === 0 ? (
+              <LeadFlowLoader compact title="Loading NYC Properties" />
+            ) : filtered.length === 0 ? (
               <div className="rounded-2xl border border-dashed border-slate-300 bg-white p-12 text-center">
                 <Building2 className="mx-auto size-10 text-slate-300" />
                 <h3 className="mt-3 text-base font-bold text-slate-800">No deals match these filters</h3>
@@ -965,7 +1022,12 @@ export default function LeadsPage() {
                   <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
                     {filtered.map((lead) => {
                       const photoSrc = getPhotoForProperty(lead.id)
-                      const score = lead.score || 85
+                      const score = explainPropertyScore({
+                        category: lead.category,
+                        reason: lead.reason,
+                        yearBuilt: lead.yearBuilt,
+                        units: lead.units,
+                      }).totalScore
                       const equitySpread = Math.round(score * 6300)
                       const isSelected = selected?.id === lead.id
 
@@ -1000,7 +1062,7 @@ export default function LeadsPage() {
                                   title={lead.dealStatus === 'vault' ? 'Remove from Saved Vault' : 'Save to Vault (Protect from batch rotation)'}
                                   onClick={(e) => {
                                     e.stopPropagation()
-                                    updateDealStatus(lead.id, lead.dealStatus === 'vault' ? 'watchlist' : 'vault')
+                                    updateDealStatus(lead.id, lead.dealStatus === 'vault' ? 'none' : 'vault')
                                   }}
                                   className={`rounded-lg p-1.5 backdrop-blur-xs transition shadow-sm ${
                                     lead.dealStatus === 'vault'
@@ -1179,11 +1241,11 @@ export default function LeadsPage() {
                     Calculated Equity Cushion
                   </span>
                   <p className="font-serif text-xl font-bold italic text-[#8edbb8]">
-                    ~${Math.round((selected.score || 85) * 6300).toLocaleString()} (62%)
+                    ~${Math.round((selectedBreakdown?.totalScore || selected.score || 85) * 6300).toLocaleString()} (62%)
                   </p>
                 </div>
                 <span className="rounded-md bg-[#176b4d] px-2.5 py-1 text-xs font-bold text-white">
-                  Score {selected.score || 85}
+                  Score {selectedBreakdown?.totalScore || selected.score || 85}/100
                 </span>
               </div>
             </div>
@@ -1216,6 +1278,17 @@ export default function LeadsPage() {
                 </div>
               )}
 
+              {/* Compact Market Intelligence Scoring Breakdown */}
+              {selectedBreakdown && (
+                <div className="rounded-2xl border border-slate-200/80 bg-white p-4">
+                  <ScoreBreakdownPanel
+                    breakdown={selectedBreakdown}
+                    compact
+                    scrollBodyClassName="max-h-[250px] overflow-y-auto [scrollbar-width:thin] [scrollbar-color:#cbd5e1_transparent]"
+                  />
+                </div>
+              )}
+
               {/* Link to Dedicated Dossier */}
               <Link
                 href={`/dashboard/properties/${encodeURIComponent(selected.id)}`}
@@ -1228,7 +1301,7 @@ export default function LeadsPage() {
               <div className="grid grid-cols-2 gap-2">
                 <button
                   type="button"
-                  onClick={() => updateDealStatus(selected.id, selected.dealStatus === 'vault' ? 'watchlist' : 'vault')}
+                  onClick={() => updateDealStatus(selected.id, selected.dealStatus === 'vault' ? 'none' : 'vault')}
                   className={`flex items-center justify-center gap-1.5 rounded-xl py-2.5 text-xs font-bold transition border ${
                     selected.dealStatus === 'vault'
                       ? 'border-emerald-300 bg-emerald-50 text-emerald-900 font-black'
@@ -1294,32 +1367,21 @@ export default function LeadsPage() {
                 </ul>
               </div>
 
-              {/* AI Brief and Export */}
-              <div className="rounded-2xl border border-violet-200 bg-violet-50/70 p-4 space-y-3">
-                <div className="flex items-start gap-3">
-                  <Sparkles className="size-4 shrink-0 text-violet-700 mt-0.5" />
-                  <div>
-                    <h4 className="text-xs font-black uppercase tracking-wider text-violet-950">
-                      AI Seller Research Summary
-                    </h4>
-                    <p className="mt-1 text-xs text-violet-900 leading-relaxed">
-                      {generatingBrief
-                        ? 'Synthesizing municipal deed signals and equity calculations...'
-                        : aiBrief?.summary ||
-                          'High-equity prospect with strong motivation signal. Low debt-to-equity ratio provides substantial deal-making flexibility.'}
-                    </p>
-                  </div>
-                </div>
-
-                <button
-                  onClick={downloadSellerBrief}
-                  disabled={generatingReport}
-                  className="flex w-full items-center justify-center gap-2 rounded-xl bg-violet-700 py-2.5 text-xs font-bold text-white shadow-xs hover:bg-violet-800 transition disabled:opacity-50"
-                >
-                  <Download className={`size-3.5 ${generatingReport ? 'animate-bounce' : ''}`} />
-                  <span>{generatingReport ? 'Generating PDF...' : 'Download Seller Research PDF'}</span>
-                </button>
-              </div>
+              {/* PDF Research Brief Download */}
+              <button
+                type="button"
+                onClick={downloadSellerBrief}
+                disabled={generatingReport}
+                className="flex w-full items-center justify-center gap-2 rounded-xl bg-[#176b4d] py-3 text-xs font-bold text-white shadow-xs transition hover:bg-[#12543d] disabled:opacity-50"
+              >
+                <Download className={`size-3.5 ${generatingReport ? 'animate-bounce' : ''}`} />
+                <span>{generatingReport ? 'Preparing Full PDF...' : 'Download Full Property Report PDF'}</span>
+              </button>
+              {reportError && (
+                <p role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-800">
+                  {reportError}
+                </p>
+              )}
 
               <div className="text-[10px] text-slate-400 leading-relaxed">
                 Source: {selected.source}. Signals indicate distress probability and do not represent verified seller intent.

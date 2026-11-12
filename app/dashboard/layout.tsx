@@ -125,7 +125,7 @@ export default function DashboardLayout({ children }: Readonly<{ children: React
               className="mt-4 flex items-center gap-2 text-xs font-bold text-white/55 hover:text-white"
             >
               <LogOut className="size-3.5" />
-              Exit demo
+              Sign out
             </button>
           ) : (
             <button

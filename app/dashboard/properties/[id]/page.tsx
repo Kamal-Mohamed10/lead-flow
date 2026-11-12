@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useState, use } from 'react'
+import { useCallback, useEffect, useRef, useState, use } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import {
@@ -10,82 +10,33 @@ import {
   ChevronDown,
   ChevronUp,
   DollarSign,
-  Info,
+  Download,
   Mail,
   MapPin,
   NotebookPen,
   Phone,
   RefreshCw,
   Shield,
-  Sparkles,
-  TrendingUp,
   User,
 } from 'lucide-react'
 import { classifyOpportunity, explainPropertyScore } from '@/lib/motivationClassifier'
 import { upsertAgentNote } from '@/lib/agentNotes'
-
-interface LeadRecord {
-  id: string
-  address: string
-  borough: string
-  zip?: string
-  block?: string
-  lot?: string
-  stage: string
-  dealStatus?: string
-  units?: number
-  yearBuilt?: number | null
-  buildingClass?: string | null
-  score?: number
-  signals?: string[]
-  source?: string
-  assignedTo?: string
-  category?: string
-  categoryNumber?: number
-  subheadline?: string
-  reason?: string
-  opportunityAngle?: string
-  badgeBg?: string
-  badgeText?: string
-  badgeBorder?: string
-}
-
-interface ContactCandidate {
-  name?: string | null
-  role?: string | null
-  mailingAddress?: string | null
-  phone?: string | null
-  email?: string | null
-  source?: string | null
-  isDnc?: boolean
-}
-
-interface FinancialSummary {
-  marketValue?: number | null
-  marketValueTaxYear?: string | null
-  recordedMortgage?: number | null
-  recordedMortgageDate?: string | null
-  taxLiensCount?: number
-  taxLiensEstimated?: number
-  estimatedEquity?: number | null
-  estimatedEquityPercent?: number | null
-}
-
-interface ResearchFindingItem {
-  status: string
-  headline: string
-  detail: string
-  evidence?: string[]
-}
-
-interface PropertyResearchResponse {
-  financials?: FinancialSummary | null
-  findings?: Record<string, ResearchFindingItem>
-}
-
-interface ContactResearchResponse {
-  contacts?: ContactCandidate[]
-}
+import {
+  findStoredProperty,
+  isActiveWatchlistLead,
+  readSavedLeads,
+  writeSavedLeads,
+} from '@/lib/propertyStorage'
+import {
+  generateFullPropertyReportPdf,
+  type ContactCandidate,
+  type ContactResearchResponse,
+  type FinancialSummary,
+  type PropertyReportProperty as LeadRecord,
+  type PropertyResearchResponse,
+  type ResearchFindingItem,
+} from '@/lib/propertyReportPdf'
+import { ScoreBreakdownPanel } from '@/components/score-breakdown-panel'
 
 type PropertyTab = 'overview' | 'research' | 'contacts'
 
@@ -101,11 +52,15 @@ export default function PropertyDetailPage({ params }: { params: Promise<{ id: s
   const [searchingContacts, setSearchingContacts] = useState(false)
   const [financials, setFinancials] = useState<FinancialSummary | null>(null)
   const [showAdditionalContacts, setShowAdditionalContacts] = useState(false)
-  const [showScoringGuide, setShowScoringGuide] = useState(true)
 
   const [loggingNote, setLoggingNote] = useState(false)
   const [loggedOwnerKey, setLoggedOwnerKey] = useState<string | null>(null)
   const [noteError, setNoteError] = useState<string | null>(null)
+  const [downloadingPdf, setDownloadingPdf] = useState(false)
+  const [pdfError, setPdfError] = useState<string | null>(null)
+
+  const researchPromiseRef = useRef<{ id: string; promise: Promise<PropertyResearchResponse | null> } | null>(null)
+  const contactsPromiseRef = useRef<{ id: string; promise: Promise<ContactResearchResponse | null> } | null>(null)
 
   useEffect(() => {
     const propertyId = decodeURIComponent(resolvedParams.id)
@@ -119,19 +74,8 @@ export default function PropertyDetailPage({ params }: { params: Promise<{ id: s
       }
     } catch {}
 
-    // 1. Look up in stored leads or delivered opportunities
-    let found: LeadRecord | null = null
-    try {
-      const crmLeads = JSON.parse(localStorage.getItem('leadflow-crm-leads') || '[]') as LeadRecord[]
-      found = crmLeads.find((l) => l.id === propertyId || l.address === propertyId) || null
-    } catch {}
-
-    if (!found) {
-      try {
-        const cached = localStorage.getItem(`leadflow-property-cache-${propertyId}`)
-        if (cached) found = JSON.parse(cached)
-      } catch {}
-    }
+    // 1. Look up in saved deals, explored catalog, or property cache
+    const found = findStoredProperty<LeadRecord>(propertyId)
 
     let resolvedProperty: LeadRecord
     if (found) {
@@ -141,6 +85,8 @@ export default function PropertyDetailPage({ params }: { params: Promise<{ id: s
         source: found.source,
         address: found.address,
         bbl: found.id,
+        yearBuilt: found.yearBuilt,
+        units: found.units,
       })
       resolvedProperty = {
         ...found,
@@ -184,49 +130,73 @@ export default function PropertyDetailPage({ params }: { params: Promise<{ id: s
     })
   }, [resolvedParams.id])
 
-  const loadResearchFor = useCallback(async (target: LeadRecord) => {
-    setResearching(true)
-    try {
-      const response = await fetch('/api/nyc/property-research', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          address: target.address,
-          borough: target.borough,
-          zip: target.zip,
-          bbl: target.id,
-        }),
-      })
-      const data = (await response.json()) as PropertyResearchResponse
-      setResearchData(data)
-      setFinancials(data.financials || null)
-    } catch {
-      setResearchData(null)
-      setFinancials(null)
-    } finally {
-      setResearching(false)
+  const loadResearchFor = useCallback(async (target: LeadRecord): Promise<PropertyResearchResponse | null> => {
+    if (researchPromiseRef.current?.id === target.id) {
+      return researchPromiseRef.current.promise
     }
+
+    const task = (async (): Promise<PropertyResearchResponse | null> => {
+      setResearching(true)
+      try {
+        const response = await fetch('/api/nyc/property-research', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            address: target.address,
+            borough: target.borough,
+            zip: target.zip,
+            bbl: target.id,
+          }),
+        })
+        const data = (await response.json()) as PropertyResearchResponse
+        setResearchData(data)
+        setFinancials(data.financials || null)
+        return data
+      } catch {
+        setResearchData(null)
+        setFinancials(null)
+        return null
+      } finally {
+        setResearching(false)
+        researchPromiseRef.current = null
+      }
+    })()
+
+    researchPromiseRef.current = { id: target.id, promise: task }
+    return task
   }, [])
 
-  const loadContactsFor = useCallback(async (target: LeadRecord) => {
-    setSearchingContacts(true)
-    try {
-      const response = await fetch('/api/nyc/contact-research', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          bbl: target.id,
-          address: target.address,
-          borough: target.borough,
-        }),
-      })
-      const data = (await response.json()) as ContactResearchResponse
-      setContactData(data)
-    } catch {
-      setContactData(null)
-    } finally {
-      setSearchingContacts(false)
+  const loadContactsFor = useCallback(async (target: LeadRecord): Promise<ContactResearchResponse | null> => {
+    if (contactsPromiseRef.current?.id === target.id) {
+      return contactsPromiseRef.current.promise
     }
+
+    const task = (async (): Promise<ContactResearchResponse | null> => {
+      setSearchingContacts(true)
+      try {
+        const response = await fetch('/api/nyc/contact-research', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            bbl: target.id,
+            address: target.address,
+            borough: target.borough,
+          }),
+        })
+        const data = (await response.json()) as ContactResearchResponse
+        setContactData(data)
+        return data
+      } catch {
+        setContactData(null)
+        return null
+      } finally {
+        setSearchingContacts(false)
+        contactsPromiseRef.current = null
+      }
+    })()
+
+    contactsPromiseRef.current = { id: target.id, promise: task }
+    return task
   }, [])
 
   // Automatically trigger forensic research and contact lookup on page load so numbers and contacts show immediately
@@ -247,16 +217,62 @@ export default function PropertyDetailPage({ params }: { params: Promise<{ id: s
     if (property) void loadContactsFor(property)
   }
 
+  async function downloadFullPropertyReport() {
+    if (!property || downloadingPdf) return
+    setDownloadingPdf(true)
+    setPdfError(null)
+    try {
+      const [latestResearch, latestContacts] = await Promise.all([
+        researchData ? Promise.resolve(researchData) : loadResearchFor(property),
+        contactData ? Promise.resolve(contactData) : loadContactsFor(property),
+      ])
+
+      const effectiveFinancials = latestResearch?.financials ?? financials ?? null
+      const effectiveBreakdown = explainPropertyScore({
+        score: property.score,
+        category: property.category,
+        reason: property.reason,
+        yearBuilt: property.yearBuilt,
+        units: property.units,
+        signals: property.signals,
+        marketValue: effectiveFinancials?.marketValue,
+        recordedMortgage: effectiveFinancials?.recordedMortgage,
+        taxLiensCount: effectiveFinancials?.taxLiensCount,
+        estimatedEquityPercent: effectiveFinancials?.estimatedEquityPercent,
+      })
+
+      await generateFullPropertyReportPdf({
+        property,
+        statusLabel,
+        financials: effectiveFinancials,
+        scoreBreakdown: effectiveBreakdown,
+        researchData: latestResearch,
+        contactData: latestContacts,
+      })
+    } catch (error) {
+      setPdfError(
+        error instanceof Error ? error.message : 'Unable to generate Property Report PDF.'
+      )
+    } finally {
+      setDownloadingPdf(false)
+    }
+  }
+
   function saveToWatchlist() {
     if (!property) return
     try {
-      const existing = JSON.parse(localStorage.getItem('leadflow-crm-leads') || '[]') as LeadRecord[]
-      const updated = [
-        { ...property, stage: 'watchlist', dealStatus: 'watchlist' },
+      const existing = readSavedLeads<LeadRecord>()
+      const savedEntry: LeadRecord = {
+        ...property,
+        score: scoreBreakdown.totalScore,
+        stage: 'watchlist',
+        dealStatus: 'watchlist',
+      }
+      writeSavedLeads([
+        savedEntry,
         ...existing.filter((item) => item.id !== property.id),
-      ]
-      localStorage.setItem('leadflow-crm-leads', JSON.stringify(updated))
-      setProperty({ ...property, stage: 'watchlist', dealStatus: 'watchlist' })
+      ])
+      setProperty(savedEntry)
     } catch {}
   }
 
@@ -292,7 +308,7 @@ export default function PropertyDetailPage({ params }: { params: Promise<{ id: s
       })
       const draft = await response.json()
       if (!response.ok) {
-        throw new Error(draft.error || 'Could not compile Agent Note with AI.')
+        throw new Error(draft.error || 'Could not compile Agent Note.')
       }
 
       upsertAgentNote({
@@ -339,15 +355,18 @@ export default function PropertyDetailPage({ params }: { params: Promise<{ id: s
     )
   }
 
-  const isWatchlisted =
-    property.dealStatus === 'watchlist' ||
-    property.dealStatus === 'vault' ||
-    property.stage === 'watchlist' ||
-    property.stage === 'qualified'
+  const isWatchlisted = isActiveWatchlistLead(property)
 
-  const statusLabel =
-    property.stage === 'qualified' || property.stage === 'watchlist'
-      ? 'Watchlist'
+  const statusLabel = isWatchlisted
+    ? property.dealStatus === 'vault'
+      ? 'Saved Vault'
+      : property.dealStatus === 'under_contract'
+        ? 'Under Contract'
+        : property.dealStatus === 'contacted'
+          ? 'Contacted'
+          : 'Watchlist'
+    : property.stage === 'qualified'
+      ? 'Not Saved'
       : property.stage.replace('_', ' ')
 
   const scoreBreakdown = explainPropertyScore({
@@ -418,8 +437,11 @@ export default function PropertyDetailPage({ params }: { params: Promise<{ id: s
 
           <div className="flex shrink-0 flex-col items-start gap-3 sm:flex-row md:items-center">
             <div className="rounded-2xl border border-slate-100 bg-[#f7f8f6] p-4 text-center">
-              <span className="block text-3xl font-black text-[#172b2a]">{property.score || 85}</span>
-              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Opportunity Score</span>
+              <span className="block text-3xl font-black text-[#172b2a]">{scoreBreakdown.totalScore}</span>
+              <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">Score / 100</span>
+              <span className="mt-0.5 block font-mono text-[9px] font-bold text-[#176b4d]">
+                {scoreBreakdown.verificationStatus === 'Live Public-Record Verified' ? 'DOF/ACRIS Verified' : '4-Pillar Rubric'}
+              </span>
             </div>
 
             <div className="flex flex-col gap-2">
@@ -454,24 +476,43 @@ export default function PropertyDetailPage({ params }: { params: Promise<{ id: s
                 className="flex items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-5 py-2 text-xs font-bold text-[#172b2a] shadow-sm transition hover:border-[#176b4d] hover:bg-[#edf7f2] disabled:opacity-60"
               >
                 <NotebookPen className="size-3.5 text-[#176b4d]" />
-                {loggingNote ? 'AI Compiling Note...' : loggedOwnerKey ? 'Saved to Agent Notes ✓' : 'AI Log to Agent Notes'}
+                {loggingNote ? 'Saving Note...' : loggedOwnerKey ? 'Saved to Agent Notes ✓' : 'Log to Agent Notes'}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => void downloadFullPropertyReport()}
+                disabled={downloadingPdf}
+                className="flex items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-5 py-2 text-xs font-bold text-[#172b2a] shadow-sm transition hover:border-[#176b4d] hover:bg-[#edf7f2] disabled:opacity-60"
+              >
+                {downloadingPdf ? (
+                  <RefreshCw className="size-3.5 animate-spin text-[#176b4d]" />
+                ) : (
+                  <Download className="size-3.5 text-[#176b4d]" />
+                )}
+                {downloadingPdf ? 'Preparing PDF...' : 'Download Report PDF'}
               </button>
             </div>
           </div>
         </div>
 
-        {(loggedOwnerKey || noteError) && (
-          <div className="mt-4">
+        {(loggedOwnerKey || noteError || pdfError) && (
+          <div className="mt-4 space-y-2">
             {noteError && (
               <p role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-2.5 text-xs font-semibold text-rose-800">
                 {noteError}
+              </p>
+            )}
+            {pdfError && (
+              <p role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-2.5 text-xs font-semibold text-rose-800">
+                {pdfError}
               </p>
             )}
             {loggedOwnerKey && !noteError && (
               <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-xs font-bold text-emerald-900">
                 <span className="flex items-center gap-2">
                   <CheckCircle2 className="size-4 text-[#176b4d]" />
-                  AI logged the address, owner name, contact info, property brief, and motivating factor to Agent Notes.
+                  Saved address, owner name, contact info, property brief, and motivating factor to Agent Notes.
                 </span>
                 <Link href="/dashboard/notes" className="underline hover:text-[#176b4d]">
                   View in Agent Notes →
@@ -607,129 +648,58 @@ export default function PropertyDetailPage({ params }: { params: Promise<{ id: s
 
       {/* Tab 1: Overview */}
       {activeTab === 'overview' && (
-        <div className="grid gap-6 md:grid-cols-2">
-          <div className="space-y-4 rounded-2xl border border-slate-200/80 bg-white p-6 shadow-sm">
+        <div className="grid items-stretch gap-6 md:grid-cols-2">
+          <div className="flex flex-col space-y-3 rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm">
             <h2 className="text-base font-black text-[#172b2a]">Building Specifications</h2>
-            <div className="grid grid-cols-2 gap-3 text-sm">
-              <div className="rounded-xl bg-slate-50 p-3.5">
-                <span className="text-xs font-bold uppercase text-slate-400">Residential Units</span>
-                <p className="mt-1 font-black text-[#172b2a]">{property.units || 'Single / 1-3 Family'}</p>
+            <div className="max-h-[280px] flex-1 space-y-3.5 overflow-y-auto pr-1.5 [scrollbar-width:thin] [scrollbar-color:#cbd5e1_transparent]">
+              <div className="grid grid-cols-2 gap-2.5 text-sm">
+                <div className="rounded-xl bg-slate-50 p-3">
+                  <span className="text-[11px] font-bold uppercase text-slate-400">Residential Units</span>
+                  <p className="mt-0.5 font-black text-[#172b2a]">{property.units || 'Single / 1-3 Family'}</p>
+                </div>
+                <div className="rounded-xl bg-slate-50 p-3">
+                  <span className="text-[11px] font-bold uppercase text-slate-400">Year Built</span>
+                  <p className="mt-0.5 font-black text-[#172b2a]">{property.yearBuilt || 'Estimated Pre-War'}</p>
+                </div>
+                <div className="rounded-xl bg-slate-50 p-3">
+                  <span className="text-[11px] font-bold uppercase text-slate-400">Building Class</span>
+                  <p className="mt-0.5 font-black text-[#172b2a]">{property.buildingClass || 'Residential Class A'}</p>
+                </div>
+                <div className="rounded-xl bg-slate-50 p-3">
+                  <span className="text-[11px] font-bold uppercase text-slate-400">Borough Tax District</span>
+                  <p className="mt-0.5 font-black text-[#172b2a]">{property.borough}</p>
+                </div>
               </div>
-              <div className="rounded-xl bg-slate-50 p-3.5">
-                <span className="text-xs font-bold uppercase text-slate-400">Year Built</span>
-                <p className="mt-1 font-black text-[#172b2a]">{property.yearBuilt || 'Estimated Pre-War'}</p>
-              </div>
-              <div className="rounded-xl bg-slate-50 p-3.5">
-                <span className="text-xs font-bold uppercase text-slate-400">Building Class</span>
-                <p className="mt-1 font-black text-[#172b2a]">{property.buildingClass || 'Residential Class A'}</p>
-              </div>
-              <div className="rounded-xl bg-slate-50 p-3.5">
-                <span className="text-xs font-bold uppercase text-slate-400">Borough Tax District</span>
-                <p className="mt-1 font-black text-[#172b2a]">{property.borough}</p>
-              </div>
-            </div>
 
-            <div className="pt-2">
-              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">Recorded Signals</h3>
-              <ul className="mt-2 space-y-2">
-                {(property.signals || []).map((sig, idx) => (
-                  <li key={idx} className="flex items-center gap-2 rounded-lg bg-[#edf7f2] p-2.5 text-xs font-semibold text-[#176b4d]">
-                    <CheckCircle2 className="size-3.5 shrink-0" />
-                    {sig}
-                  </li>
-                ))}
-              </ul>
-            </div>
+              <div className="pt-1">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">Recorded Signals</h3>
+                <ul className="mt-2 space-y-1.5">
+                  {(property.signals || []).map((sig, idx) => (
+                    <li key={idx} className="flex items-center gap-2 rounded-lg bg-[#edf7f2] p-2 text-xs font-semibold text-[#176b4d]">
+                      <CheckCircle2 className="size-3.5 shrink-0" />
+                      {sig}
+                    </li>
+                  ))}
+                </ul>
+              </div>
 
-            <div className="rounded-xl border border-slate-200 bg-[#f7f8f6] p-4 space-y-2">
-              <p className="text-xs font-black uppercase tracking-wider text-[#172b2a]">Research Workflow</p>
-              <ol className="list-decimal space-y-1.5 pl-4 text-xs font-medium text-slate-700">
-                <li>Inspect forensic title filings, municipal liens, and violations.</li>
-                <li>Use <strong>Find Owner</strong> to uncover deed holders, mailing addresses, and public phone records.</li>
-                <li>Have AI compile the address, owner contact info, property brief, and motivating factor into <strong>Agent Notes</strong>.</li>
-              </ol>
+              <div className="rounded-xl border border-slate-200 bg-[#f7f8f6] p-3.5 space-y-1.5">
+                <p className="text-xs font-black uppercase tracking-wider text-[#172b2a]">Research Workflow</p>
+                <ol className="list-decimal space-y-1 pl-4 text-xs font-medium text-slate-700">
+                  <li>Inspect forensic title filings, municipal liens, and violations.</li>
+                  <li>Use <strong>Find Owner</strong> to uncover deed holders, mailing addresses, and public phone records.</li>
+                  <li>Save the address, owner contact info, property brief, and motivating factor into <strong>Agent Notes</strong>.</li>
+                </ol>
+              </div>
             </div>
           </div>
 
           {/* Market Intelligence & Scoring System Explanation */}
-          <div className="space-y-4 rounded-2xl border border-slate-200/80 bg-white p-6 shadow-sm">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
-                <TrendingUp className="size-4 text-[#176b4d]" />
-                <h2 className="text-base font-black text-[#172b2a]">Market Intelligence</h2>
-              </div>
-              <span className={`rounded-full border px-2.5 py-0.5 text-[11px] font-black ${scoreBreakdown.tierColor}`}>
-                Score {scoreBreakdown.totalScore}/100 · {scoreBreakdown.tier}
-              </span>
-            </div>
-
-            <div className="rounded-xl border border-emerald-200 bg-emerald-50/50 p-4">
-              <p className="text-[11px] font-black uppercase tracking-wider text-[#176b4d]">
-                Why This Property Scored {scoreBreakdown.totalScore}/100
-              </p>
-              <p className="mt-1.5 text-xs leading-relaxed text-slate-700">{scoreBreakdown.summary}</p>
-            </div>
-
-            {/* Factor-by-factor driver list for this property */}
-            <div className="space-y-2.5">
-              {scoreBreakdown.factors.map((factor) => (
-                <div key={factor.label} className="rounded-xl border border-slate-200/80 bg-[#f7f8f6] p-3.5">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span className="text-xs font-black text-[#172b2a]">{factor.label}</span>
-                    <div className="flex items-center gap-1.5">
-                      <span className="rounded-md bg-white px-2 py-0.5 text-[10px] font-bold text-slate-600 border border-slate-200">
-                        {factor.weight}
-                      </span>
-                      <span
-                        className={`rounded-md px-2 py-0.5 text-[10px] font-black uppercase ${
-                          factor.impact === 'High'
-                            ? 'bg-emerald-100 text-emerald-800'
-                            : factor.impact === 'Moderate'
-                              ? 'bg-amber-100 text-amber-800'
-                              : 'bg-slate-200 text-slate-700'
-                        }`}
-                      >
-                        {factor.impact} Impact
-                      </span>
-                    </div>
-                  </div>
-                  <p className="mt-1.5 text-xs leading-relaxed text-slate-600">{factor.detail}</p>
-                </div>
-              ))}
-            </div>
-
-            {/* Explanation of LeadFlow's overall scoring system */}
-            <div className="rounded-xl border border-slate-200 bg-white p-4">
-              <button
-                type="button"
-                onClick={() => setShowScoringGuide((v) => !v)}
-                className="flex w-full items-center justify-between text-left"
-              >
-                <span className="flex items-center gap-2 text-xs font-black uppercase tracking-wider text-[#172b2a]">
-                  <Info className="size-3.5 text-[#176b4d]" />
-                  How Our 0–100 Scoring System Works
-                </span>
-                {showScoringGuide ? (
-                  <ChevronUp className="size-4 text-slate-400" />
-                ) : (
-                  <ChevronDown className="size-4 text-slate-400" />
-                )}
-              </button>
-
-              {showScoringGuide && (
-                <div className="mt-3 space-y-2.5 border-t border-slate-100 pt-3">
-                  {scoreBreakdown.systemPillars.map((pillar) => (
-                    <div key={pillar.title} className="text-xs leading-relaxed">
-                      <div className="flex items-center justify-between font-bold text-[#172b2a]">
-                        <span>{pillar.title}</span>
-                        <span className="font-mono text-[10px] text-[#176b4d]">{pillar.maxPoints}</span>
-                      </div>
-                      <p className="mt-0.5 text-[11px] text-slate-600">{pillar.description}</p>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
+          <div className="flex flex-col justify-between space-y-3 rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm">
+            <ScoreBreakdownPanel
+              breakdown={scoreBreakdown}
+              scrollBodyClassName="max-h-[225px] overflow-y-auto [scrollbar-width:thin] [scrollbar-color:#cbd5e1_transparent]"
+            />
 
             <div className="grid grid-cols-2 gap-2 pt-1">
               <button
@@ -737,7 +707,7 @@ export default function PropertyDetailPage({ params }: { params: Promise<{ id: s
                   setActiveTab('research')
                   if (!researchData) void loadResearch()
                 }}
-                className="rounded-xl border border-slate-200 bg-white py-3 text-xs font-bold text-[#172b2a] transition hover:bg-slate-50"
+                className="rounded-xl border border-slate-200 bg-white py-2.5 text-xs font-bold text-[#172b2a] transition hover:bg-slate-50"
               >
                 Forensic Research →
               </button>
@@ -746,7 +716,7 @@ export default function PropertyDetailPage({ params }: { params: Promise<{ id: s
                   setActiveTab('contacts')
                   if (!contactData) void loadContacts()
                 }}
-                className="rounded-xl bg-[#172b2a] py-3 text-xs font-bold text-white transition hover:bg-slate-800"
+                className="rounded-xl bg-[#172b2a] py-2.5 text-xs font-bold text-white transition hover:bg-slate-800"
               >
                 Find Owner →
               </button>
@@ -833,15 +803,15 @@ export default function PropertyDetailPage({ params }: { params: Promise<{ id: s
               </div>
             ) : (
               <div className="mt-5 space-y-4">
-                {/* AI Agent Notes Logger Card */}
+                {/* Agent Notes Logger Card */}
                 <div className="flex flex-col gap-3 rounded-xl border border-emerald-200 bg-emerald-50/70 p-4 sm:flex-row sm:items-center sm:justify-between">
                   <div>
                     <h3 className="flex items-center gap-1.5 text-xs font-black uppercase tracking-wider text-emerald-900">
-                      <Sparkles className="size-3.5 text-[#176b4d]" />
-                      AI Agent Notes Logger
+                      <NotebookPen className="size-3.5 text-[#176b4d]" />
+                      Agent Notes Logger
                     </h3>
                     <p className="mt-0.5 text-xs text-emerald-800">
-                      Once you find an owner number or contact details, AI automatically logs the property address, owner name, contact info, brief property description, and motivating factor to Agent Notes.
+                      Once you find an owner number or contact details, save the property address, owner name, contact info, brief property description, and motivating factor to Agent Notes.
                     </p>
                   </div>
                   <div className="flex shrink-0 items-center gap-2">
@@ -852,7 +822,7 @@ export default function PropertyDetailPage({ params }: { params: Promise<{ id: s
                       className="flex items-center justify-center gap-2 rounded-xl bg-[#176b4d] px-4 py-2.5 text-xs font-bold text-white shadow-xs transition hover:bg-[#12543d] disabled:opacity-60"
                     >
                       <NotebookPen className="size-4" />
-                      {loggingNote ? 'Compiling...' : loggedOwnerKey === 'banner' ? 'Logged to Agent Notes ✓' : 'AI Save to Agent Notes'}
+                      {loggingNote ? 'Saving...' : loggedOwnerKey === 'banner' ? 'Saved to Agent Notes ✓' : 'Save to Agent Notes'}
                     </button>
                     <Link
                       href="/dashboard/notes"
@@ -942,7 +912,7 @@ export default function PropertyDetailPage({ params }: { params: Promise<{ id: s
                             className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-300 bg-white px-3 py-1.5 font-bold text-[#172b2a] shadow-xs transition hover:bg-emerald-50 disabled:opacity-50"
                           >
                             <NotebookPen className="size-3.5 text-[#176b4d]" />
-                            <span>{loggedOwnerKey === cardKey ? 'Logged to Agent Notes ✓' : 'Add to Agent Notes (AI)'}</span>
+                            <span>{loggedOwnerKey === cardKey ? 'Saved to Agent Notes ✓' : 'Save to Agent Notes'}</span>
                           </button>
 
                           {/* Free Reverse Lookup Shortcuts */}
@@ -1023,7 +993,7 @@ export default function PropertyDetailPage({ params }: { params: Promise<{ id: s
                 })() : (
                   <div className="py-6 text-center text-xs text-slate-500">
                     No registered party phone numbers returned directly from municipal registries. Use{' '}
-                    <strong>AI Save to Agent Notes</strong> above to log the property brief and motivating factor while you verify secondary contact channels.
+                    <strong>Save to Agent Notes</strong> above to log the property brief and motivating factor while you verify secondary contact channels.
                   </div>
                 )}
               </div>

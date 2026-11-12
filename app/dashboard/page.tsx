@@ -16,8 +16,40 @@ import {
   TrendingUp,
   Users,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, useSyncExternalStore } from 'react'
+import { LeadFlowLoader } from '@/components/leadflow-loader'
 import { classifyOpportunity } from '@/lib/motivationClassifier'
+import {
+  consumePriorityQueuePrefetch,
+  isActiveWatchlistLead,
+  readPriorityQueueCache,
+  readSavedLeads,
+  WATCHLIST_UPDATED_EVENT,
+  writePriorityQueueCache,
+  writeSavedLeads,
+} from '@/lib/propertyStorage'
+
+function subscribeToUserGreeting(onChange: () => void) {
+  window.addEventListener('storage', onChange)
+  window.addEventListener('leadflow-demo-mode-change', onChange)
+  return () => {
+    window.removeEventListener('storage', onChange)
+    window.removeEventListener('leadflow-demo-mode-change', onChange)
+  }
+}
+
+function getGreetingFirstName() {
+  const rawName = (localStorage.getItem('leadflow-user-name') || '').trim()
+  const isDemo = localStorage.getItem('leadflow-demo-mode') === 'true'
+  if (!rawName || rawName === 'Demo Agent') {
+    return isDemo ? 'Kamal' : 'Agent'
+  }
+  return rawName.split(/\s+/)[0]
+}
+
+function getServerGreetingFirstName() {
+  return 'Kamal'
+}
 
 interface Lead {
   id: string
@@ -49,6 +81,11 @@ interface Lead {
 type DashboardFilter = 'all' | 'delivered-today' | 'high-signal' | 'watchlist'
 
 export default function DashboardPage() {
+  const greetingName = useSyncExternalStore(
+    subscribeToUserGreeting,
+    getGreetingFirstName,
+    getServerGreetingFirstName
+  )
   const [leads, setLeads] = useState<Lead[]>([])
   const [delivered, setDelivered] = useState<Lead[]>([])
   const [queueFilter, setQueueFilter] = useState<DashboardFilter>('all')
@@ -88,12 +125,26 @@ export default function DashboardPage() {
     setFeedError('')
     try {
       const demoMode = localStorage.getItem('leadflow-demo-mode') === 'true'
-      let savedLeads: Lead[] = []
-      try {
-        savedLeads = JSON.parse(localStorage.getItem('leadflow-crm-leads') || '[]')
-      } catch {
-        savedLeads = []
+      const savedLeads = readSavedLeads<Lead>()
+      const existing = new Set(savedLeads.map((lead) => lead.id))
+      const unlockTime =
+        Number(localStorage.getItem('leadflow-batch-unlock-time')) || Date.now() + 3600 * 1000
+
+      if (!refresh && demoMode) {
+        const cached = readPriorityQueueCache<Lead>()
+        if (cached && (!cached.unlockTime || Date.now() < cached.unlockTime)) {
+          const validCached = cached.opportunities.filter((item) => !existing.has(item.id))
+          if (validCached.length > 0) {
+            setDelivered(validCached)
+            setLeads(savedLeads)
+            setFetchedAt(cached.fetchedAt || new Date().toLocaleTimeString())
+            setLoading(false)
+            setRefreshing(false)
+            return
+          }
+        }
       }
+
       const excludedBbls = savedLeads
         .map((lead) => lead.id)
         .filter((id) => /^[1-5]\d{9}$/.test(id))
@@ -102,86 +153,111 @@ export default function DashboardPage() {
         ? savedTerritory.boroughs
         : []
 
-      const response = demoMode
-        ? await fetch('/api/nyc/opportunities/discover', {
+      let data: {
+        opportunities?: any[]
+        data?: any[]
+        source?: string
+        message?: string | null
+        error?: string
+      }
+
+      if (demoMode) {
+        const prefetched = !refresh ? await consumePriorityQueuePrefetch() : null
+        if (prefetched && Array.isArray(prefetched.opportunities)) {
+          data = prefetched
+        } else {
+          const response = await fetch('/api/nyc/opportunities/discover', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ limit: 20, excludedBbls, boroughs }),
+            body: JSON.stringify({ limit: 20, excludedBbls, boroughs, prioritize: true }),
           })
-        : await fetch('/api/cron/enrich-properties', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ limit: 20, boroughs }),
-          })
-      const data = await response.json()
-      if (!response.ok) throw new Error(data.error || 'Live opportunity discovery failed.')
+          data = await response.json()
+          if (!response.ok) throw new Error(data.error || 'Live opportunity discovery failed.')
+        }
+      } else {
+        const response = await fetch('/api/cron/enrich-properties', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ limit: 20, boroughs }),
+        })
+        data = await response.json()
+        if (!response.ok) throw new Error(data.error || 'Live opportunity discovery failed.')
+      }
 
       const incoming = demoMode
         ? data.opportunities || []
         : (data.data || []).map((item: any) => ({
             ...item,
             id: item.bbl,
-            score: item.enriched?.opportunityScore || 85,
+            score: typeof item.score === 'number' ? item.score : item.enriched?.opportunityScore || 85,
           }))
 
       if (!incoming.length) {
-        setFeedError(data.message || 'No new properties were found. Your hourly AI batch will bring fresh records.')
+        setFeedError(data.message || 'No new properties were found. Your next hourly batch will bring fresh records.')
       }
 
-      const existing = new Set(savedLeads.map((lead) => lead.id))
       const deliveryDates = JSON.parse(localStorage.getItem('leadflow-opportunity-delivery-dates') || '{}') as Record<string, string>
       const now = new Date().toISOString()
-      const opportunities = incoming
-        .filter((item: any) => !existing.has(String(item.id || item.bbl)))
-        .slice(0, 20)
-        .map((item: any) => {
-          const classification = classifyOpportunity({
-            documentType: item.documentType,
-            signals: item.signals,
-            source: item.source,
-            ownerName: item.ownerName,
-            address: item.address,
-            bbl: item.id || item.bbl,
-          })
+      const opportunities = (
+        incoming
+          .filter((item: any) => !existing.has(String(item.id || item.bbl)))
+          .map((item: any) => {
+            const units = Number(item.units || 0)
+            const yearBuilt = item.yearBuilt ?? null
+            const classification = classifyOpportunity({
+              documentType: item.documentType,
+              signals: item.signals,
+              source: item.source,
+              ownerName: item.ownerName,
+              address: item.address,
+              bbl: item.id || item.bbl,
+              yearBuilt,
+              units,
+            })
 
-          return {
-            id: String(item.id),
-            address: item.address,
-            borough: item.borough,
-            zip: item.zip || '',
-            block: String(item.block || ''),
-            lot: String(item.lot || ''),
-            stage: 'ingested',
-            units: Number(item.units || 0),
-            yearBuilt: item.yearBuilt ?? null,
-            buildingClass: item.buildingClass ?? null,
-            score: item.score || classification.score,
-            category: item.category || classification.category,
-            categoryNumber: item.categoryNumber || classification.categoryNumber,
-            subheadline: item.subheadline || classification.subheadline,
-            reason: item.reason || classification.reason,
-            opportunityAngle: item.opportunityAngle || classification.opportunityAngle,
-            badgeBg: item.badgeBg || classification.badgeBg,
-            badgeText: item.badgeText || classification.badgeText,
-            badgeBorder: item.badgeBorder || classification.badgeBorder,
-            signals: Array.isArray(item.signals) && item.signals.length ? item.signals : [
-              `${classification.category}: ${classification.subheadline}`,
-              classification.reason,
-            ],
-            source: item.source || data.source || 'NYC Open Data',
-            assignedTo: localStorage.getItem('leadflow-user-name') || 'You',
-            deliveredAt: deliveryDates[String(item.id)] || now,
-          }
-        }) as Lead[]
+            return {
+              id: String(item.id),
+              address: item.address,
+              borough: item.borough,
+              zip: item.zip || '',
+              block: String(item.block || ''),
+              lot: String(item.lot || ''),
+              stage: 'ingested',
+              units,
+              yearBuilt,
+              buildingClass: item.buildingClass ?? null,
+              score: typeof item.score === 'number' ? item.score : classification.score,
+              category: item.category || classification.category,
+              categoryNumber: item.categoryNumber || classification.categoryNumber,
+              subheadline: item.subheadline || classification.subheadline,
+              reason: item.reason || classification.reason,
+              opportunityAngle: item.opportunityAngle || classification.opportunityAngle,
+              badgeBg: item.badgeBg || classification.badgeBg,
+              badgeText: item.badgeText || classification.badgeText,
+              badgeBorder: item.badgeBorder || classification.badgeBorder,
+              signals: Array.isArray(item.signals) && item.signals.length ? item.signals : [
+                `${classification.category}: ${classification.subheadline}`,
+                classification.reason,
+              ],
+              source: item.source || data.source || 'NYC Open Data',
+              assignedTo: localStorage.getItem('leadflow-user-name') || 'You',
+              deliveredAt: deliveryDates[String(item.id)] || now,
+            }
+          }) as Lead[]
+      )
+        .sort((a, b) => (b.score || 0) - (a.score || 0))
+        .slice(0, 20)
 
       opportunities.forEach((item) => {
         if (!deliveryDates[item.id]) deliveryDates[item.id] = item.deliveredAt || now
       })
+      const fetchedLabel = new Date().toLocaleTimeString()
       localStorage.setItem('leadflow-opportunity-delivery-dates', JSON.stringify(deliveryDates))
       localStorage.setItem('leadflow-delivered-opportunity-ids', JSON.stringify(opportunities.map((item) => item.id)))
+      writePriorityQueueCache(opportunities, fetchedLabel, unlockTime)
       setDelivered(opportunities)
       setLeads(savedLeads)
-      setFetchedAt(new Date().toLocaleTimeString())
+      setFetchedAt(fetchedLabel)
     } catch (error) {
       setFeedError(error instanceof Error ? error.message : 'Live opportunity discovery failed.')
     } finally {
@@ -192,6 +268,13 @@ export default function DashboardPage() {
 
   useEffect(() => {
     loadOpportunities()
+    const syncSaved = () => setLeads(readSavedLeads<Lead>())
+    window.addEventListener('storage', syncSaved)
+    window.addEventListener(WATCHLIST_UPDATED_EVENT, syncSaved)
+    return () => {
+      window.removeEventListener('storage', syncSaved)
+      window.removeEventListener(WATCHLIST_UPDATED_EVENT, syncSaved)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-hooks
   }, [])
 
@@ -202,27 +285,30 @@ export default function DashboardPage() {
     loadOpportunities(true)
   }
 
-  const watchlistCount = leads.filter((lead) => ['qualified', 'watchlist', 'under_contract'].includes(lead.stage) || lead.dealStatus === 'watchlist').length
+  const watchlistLeads = leads.filter(isActiveWatchlistLead)
+  const watchlistCount = watchlistLeads.length
   const highSignal = delivered.filter((lead) => (lead.score || 0) >= 70).length
   const todayKey = new Date().toLocaleDateString()
   const deliveredToday = delivered.filter((lead) => lead.deliveredAt && new Date(lead.deliveredAt).toLocaleDateString() === todayKey).length
 
   const queueItems = queueFilter === 'watchlist'
-    ? leads.filter((lead) => ['qualified', 'watchlist', 'under_contract'].includes(lead.stage) || lead.dealStatus === 'watchlist')
+    ? watchlistLeads
     : queueFilter === 'high-signal'
       ? delivered.filter((lead) => (lead.score || 0) >= 70)
       : queueFilter === 'delivered-today'
         ? delivered.filter((lead) => lead.deliveredAt && new Date(lead.deliveredAt).toLocaleDateString() === todayKey)
         : delivered
 
-  // Filtered priority queue items using in-box filter controls (User requirement #6)
+  // Filtered priority queue items using in-box filter controls (User requirement #6), always ranked highest score first
   const filteredQueueItems = useMemo(() => {
-    return queueItems.filter((lead) => {
-      if (queueBoroughFilter !== 'All' && lead.borough !== queueBoroughFilter) return false
-      if (queueCategoryFilter !== 'All' && lead.category !== queueCategoryFilter) return false
-      if (queueSearchQuery && !`${lead.address} ${lead.borough} ${lead.zip}`.toLowerCase().includes(queueSearchQuery.toLowerCase())) return false
-      return true
-    })
+    return queueItems
+      .filter((lead) => {
+        if (queueBoroughFilter !== 'All' && lead.borough !== queueBoroughFilter) return false
+        if (queueCategoryFilter !== 'All' && lead.category !== queueCategoryFilter) return false
+        if (queueSearchQuery && !`${lead.address} ${lead.borough} ${lead.zip}`.toLowerCase().includes(queueSearchQuery.toLowerCase())) return false
+        return true
+      })
+      .sort((a, b) => (b.score || 0) - (a.score || 0))
   }, [queueItems, queueBoroughFilter, queueCategoryFilter, queueSearchQuery])
 
   const queueTitle = queueFilter === 'high-signal'
@@ -234,14 +320,7 @@ export default function DashboardPage() {
         : 'Priority Queue'
 
   function addToPipeline(property: Lead, stage: 'watchlist') {
-    let pipeline: Lead[] = []
-    try {
-      const saved = JSON.parse(localStorage.getItem('leadflow-crm-leads') || '[]')
-      if (Array.isArray(saved)) pipeline = saved
-    } catch {
-      setFeedError('Could not read the saved pipeline. The property was not added.')
-      return
-    }
+    const pipeline = readSavedLeads<Lead>()
 
     if (pipeline.some((lead) => lead.id === property.id)) {
       const remaining = delivered.filter((item) => item.id !== property.id)
@@ -251,9 +330,9 @@ export default function DashboardPage() {
     }
 
     // Mark as watchlist/wishlist explicitly
-    const updated = [{ ...property, stage, dealStatus: 'watchlist' as const }, ...pipeline]
+    const updated: Lead[] = [{ ...property, stage, dealStatus: 'watchlist' as const }, ...pipeline]
     try {
-      localStorage.setItem('leadflow-crm-leads', JSON.stringify(updated))
+      writeSavedLeads(updated)
     } catch {
       setFeedError('The browser could not save this property to your watchlist. Please try again.')
       return
@@ -261,6 +340,11 @@ export default function DashboardPage() {
     setLeads(updated)
     const remaining = delivered.filter((item) => item.id !== property.id)
     setDelivered(remaining)
+    writePriorityQueueCache(
+      remaining,
+      fetchedAt || new Date().toLocaleTimeString(),
+      Number(localStorage.getItem('leadflow-batch-unlock-time')) || 0
+    )
   }
 
   function showQueue(filter: DashboardFilter) {
@@ -277,10 +361,10 @@ export default function DashboardPage() {
             Daily Overview
           </p>
           <h1 className="font-serif text-3xl font-black italic tracking-tight text-[#172b2a]">
-            Good Morning, Agent
+            Good Morning {greetingName}
           </h1>
           <p className="mt-1 text-sm text-slate-500">
-            LeadFlow delivers AI-ranked NYC off-market opportunities hourly so you can start with the best deals first.
+            LeadFlow delivers priority-ranked NYC off-market opportunities hourly so you can start with the best deals first.
           </p>
         </div>
 
@@ -298,7 +382,7 @@ export default function DashboardPage() {
           ) : (
             <div className="flex items-center gap-2.5 rounded-xl border border-slate-200 bg-white px-4 py-3 text-xs font-bold text-slate-700 shadow-xs">
               <Clock className="size-4 text-[#176b4d] animate-pulse" />
-              <span className="text-slate-500">Next AI Discovery Batch in:</span>
+              <span className="text-slate-500">Next Discovery Batch in:</span>
               <span className="font-mono text-sm font-black text-[#172b2a]">
                 {String(Math.floor(secondsUntilNextBatch / 60)).padStart(2, '0')}:
                 {String(secondsUntilNextBatch % 60).padStart(2, '0')}
@@ -321,7 +405,7 @@ export default function DashboardPage() {
             label: 'Delivered Today',
             value: deliveredToday,
             Icon: Sparkles,
-            detail: 'AI-ranked opportunities in today’s feed',
+            detail: 'Ranked opportunities in today’s feed',
             onClick: () => showQueue('delivered-today'),
             active: queueFilter === 'delivered-today',
           },
@@ -370,7 +454,7 @@ export default function DashboardPage() {
           <section id="priority-queue" className="scroll-mt-6 rounded-2xl border border-slate-200/80 bg-white p-6 shadow-xs">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-4">
               <div>
-                <p className="text-xs font-bold uppercase tracking-widest text-[#176b4d]">AI Priority Queue</p>
+                <p className="text-xs font-bold uppercase tracking-widest text-[#176b4d]">Priority Queue · Highest Scores First</p>
                 <h2 className="mt-0.5 text-xl font-black text-[#172b2a]">{queueTitle}</h2>
               </div>
               <div className="flex items-center gap-2">
@@ -437,12 +521,10 @@ export default function DashboardPage() {
             </div>
 
             {loading ? (
-              <div className="mt-4 rounded-xl bg-[#f7f8f6] p-8 text-center text-xs text-slate-400">
-                Finding and ranking NYC opportunities…
-              </div>
+              <LeadFlowLoader userName={greetingName} />
             ) : filteredQueueItems.length ? (
               <div className="mt-4 max-h-[480px] overflow-y-auto pr-1 space-y-2.5 [scrollbar-width:thin] [scrollbar-color:#cbd5e1_transparent]">
-                {filteredQueueItems.map((lead) => {
+                {filteredQueueItems.map((lead, index) => {
                   const isNewOpportunity = delivered.some((item) => item.id === lead.id)
                   const badgeBg = lead.badgeBg || 'bg-amber-50'
                   const badgeText = lead.badgeText || 'text-amber-800'
@@ -470,6 +552,9 @@ export default function DashboardPage() {
                         </div>
                         <div className="min-w-0 flex-1">
                           <div className="flex flex-wrap items-center gap-2">
+                            <span className="rounded-md bg-[#172b2a] px-1.5 py-0.5 text-[11px] font-black text-white">
+                              #{index + 1}
+                            </span>
                             <p className="truncate text-sm font-bold text-slate-900 group-hover:text-[#176b4d] group-hover:underline">
                               {lead.address}
                             </p>
@@ -561,7 +646,7 @@ export default function DashboardPage() {
             <div>
               <p className="text-sm font-black text-[#172b2a]">Active Workspace</p>
               <p className="mt-0.5 text-xs text-slate-500">
-                Done with the AI queue? Search territory maps and photos yourself.
+                Done with the priority queue? Search territory maps and photos yourself.
               </p>
             </div>
 

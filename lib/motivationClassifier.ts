@@ -113,27 +113,68 @@ export const OPPORTUNITY_CATEGORIES: Record<OpportunityCategoryKey, OpportunityC
 
 export interface ScoreFactor {
   label: string
+  pointsEarned: number
+  maxPoints: number
   weight: string
   impact: 'High' | 'Moderate' | 'Supporting'
+  sourceTag: string
+  verified: boolean
   detail: string
 }
 
 export interface ScoreExplanation {
   totalScore: number
+  equationLabel: string
   tier: string
   tierColor: string
   summary: string
+  verificationStatus: 'Live Public-Record Verified' | 'Parcel & Filing Baseline'
   factors: ScoreFactor[]
   systemPillars: Array<{
     title: string
     maxPoints: string
+    formula: string
     description: string
   }>
 }
 
+const CATEGORY_SIGNAL_POINTS: Record<OpportunityCategoryKey, number> = {
+  foreclosure_auction: 45,
+  tax_delinquent: 43,
+  pre_foreclosure: 41,
+  estate_probate: 38,
+  short_sale: 36,
+  bank_owned: 35,
+  vacant_property: 33,
+  expired_withdrawn: 30,
+}
+
+const CATEGORY_BASELINE_EQUITY_POINTS: Record<OpportunityCategoryKey, number> = {
+  foreclosure_auction: 22,
+  tax_delinquent: 22,
+  pre_foreclosure: 21,
+  estate_probate: 21,
+  vacant_property: 18,
+  bank_owned: 18,
+  short_sale: 17,
+  expired_withdrawn: 16,
+}
+
+function matchCategoryKey(categoryName?: string | null): OpportunityCategoryKey | null {
+  if (!categoryName) return null
+  const normalized = categoryName.trim().toLowerCase()
+  const found = Object.values(OPPORTUNITY_CATEGORIES).find(
+    (c) => c.name.toLowerCase() === normalized || c.id === normalized
+  )
+  return found ? found.id : null
+}
+
 /**
- * Generates a transparent breakdown explaining why a specific property received its score
- * alongside an overview of how LeadFlow's 0-100 scoring system works.
+ * Computes the transparent 100-point rubric:
+ * 1. Distress Catalyst & Filing Urgency (0-45 pts)
+ * 2. Equity Spread & Debt Exposure (0-25 pts)
+ * 3. Building Age & Capital Stagnation (0-18 pts)
+ * 4. Ownership Structure & Deal Agility (0-12 pts)
  */
 export function explainPropertyScore(input: {
   score?: number | null
@@ -141,120 +182,191 @@ export function explainPropertyScore(input: {
   reason?: string | null
   yearBuilt?: number | null
   units?: number | null
+  recentAlteration?: boolean | null
   signals?: string[]
   marketValue?: number | null
   recordedMortgage?: number | null
   taxLiensCount?: number
   estimatedEquityPercent?: number | null
 }): ScoreExplanation {
-  const totalScore = Math.max(1, Math.min(100, Math.round(input.score || 85)))
+  const matchedKey = matchCategoryKey(input.category)
+  const matchedCategory = matchedKey ? OPPORTUNITY_CATEGORIES[matchedKey] : null
+  const triggerLabel = matchedCategory ? matchedCategory.name : input.category || 'Off-Market Distress Signal'
+
+  // 1. Distress Catalyst & Filing Urgency (max 45 pts)
+  const signalPoints = matchedKey ? CATEGORY_SIGNAL_POINTS[matchedKey] : 34
+
+  // 2. Equity Cushion & Debt Exposure (max 25 pts)
+  const hasLiveFinancials =
+    (input.marketValue !== null && input.marketValue !== undefined) ||
+    (input.estimatedEquityPercent !== null && input.estimatedEquityPercent !== undefined) ||
+    typeof input.taxLiensCount === 'number'
+
+  let equityPoints: number
+  let equityDetail: string
+
+  if (hasLiveFinancials) {
+    const eqPct = input.estimatedEquityPercent
+    const eqBase =
+      eqPct === null || eqPct === undefined
+        ? 15
+        : eqPct >= 60
+          ? 20
+          : eqPct >= 45
+            ? 17
+            : eqPct >= 30
+              ? 14
+              : eqPct >= 15
+                ? 11
+                : 9
+    const liens = typeof input.taxLiensCount === 'number' ? input.taxLiensCount : 0
+    const lienBonus = liens >= 2 ? 5 : liens === 1 ? 4 : 2
+    equityPoints = Math.min(25, eqBase + lienBonus)
+    equityDetail =
+      eqPct !== null && eqPct !== undefined
+        ? `Live NYC DOF valuation shows ~${eqPct}% net equity (${eqBase}/20 spread pts)${
+            liens > 0
+              ? ` plus ${liens} active municipal lien filing${liens === 1 ? '' : 's'} (+${lienBonus} urgency pts).`
+              : ` with distress catalyst verification (+${lienBonus} debt check pts).`
+          }`
+        : `Verified municipal lien count (${liens}) combined with DOF valuation and ACRIS debt lookup.`
+  } else {
+    equityPoints = matchedKey ? CATEGORY_BASELINE_EQUITY_POINTS[matchedKey] : 19
+    equityDetail = `Signal-implied baseline (${equityPoints}/25 pts) for "${triggerLabel}". Open the Instant Forensic Research tab to pull live NYC DOF valuations, ACRIS mortgages, and tax liens and replace this estimate with verified balances.`
+  }
+
+  // 3. Building Age & Capital Stagnation (max 18 pts: up to 14 age + 4 stagnation)
   const currentYear = new Date().getFullYear()
   const built = input.yearBuilt && input.yearBuilt > 1500 ? input.yearBuilt : null
   const age = built ? Math.max(0, currentYear - built) : null
-  const agePoints = age !== null ? Math.min(25, Math.round(age / 2)) : 18
-  const units = typeof input.units === 'number' && input.units > 0 ? input.units : null
-  const isLowDensity = units === null || units <= 3
+  const ageCore = age !== null ? Math.min(14, Math.max(4, Math.round(age / 7))) : 11
+  const stagnationPoints = input.recentAlteration === true ? 0 : 4
+  const agePoints = Math.min(18, ageCore + stagnationPoints)
 
-  const matchedCategory = Object.values(OPPORTUNITY_CATEGORIES).find(
-    (c) => c.name.toLowerCase() === (input.category || '').toLowerCase()
-  )
-  const categoryScore = matchedCategory?.defaultScore || totalScore
+  // 4. Ownership Structure & Decision Agility (max 12 pts)
+  const units = typeof input.units === 'number' && input.units > 0 ? input.units : null
+  const agilityPoints = units === null || units <= 3 ? 12 : units <= 10 ? 8 : 5
+
+  const totalScore = Math.max(1, Math.min(100, signalPoints + equityPoints + agePoints + agilityPoints))
 
   const tier =
     totalScore >= 90
       ? 'Critical Priority (90–100)'
-      : totalScore >= 80
-        ? 'High Likelihood to Sell (80–89)'
-        : 'Emerging Watch (65–79)'
+      : totalScore >= 75
+        ? 'High Likelihood to Sell (75–89)'
+        : 'Moderate Watch · Verify First (<75)'
 
   const tierColor =
     totalScore >= 90
       ? 'bg-rose-50 text-rose-800 border-rose-200'
-      : totalScore >= 80
+      : totalScore >= 75
         ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
         : 'bg-amber-50 text-amber-800 border-amber-200'
 
-  const triggerLabel = matchedCategory ? matchedCategory.name : input.category || 'Off-Market Distress Signal'
+  const verificationStatus = hasLiveFinancials ? 'Live Public-Record Verified' : 'Parcel & Filing Baseline'
+  const equationLabel = `${signalPoints} Filing + ${equityPoints} Equity/Liens + ${agePoints} Vintage + ${agilityPoints} Ownership = ${totalScore}/100`
 
-  const summary =
-    totalScore >= 90
-      ? `Scored ${totalScore}/100 because public registries flag an urgent "${triggerLabel}" timeline paired with ${
-          isLowDensity ? 'direct-decision low-density ownership' : 'elevated carrying complexity'
-        }, putting this parcel in our highest off-market sale probability tier.`
-      : `Scored ${totalScore}/100 from the combination of "${triggerLabel}" indicators, NYC PLUTO building vintage, and ${
-          isLowDensity ? 'flexible small-parcel ownership' : 'multi-unit holding overhead'
-        }.`
-
-  const equityDetail =
-    input.estimatedEquityPercent !== null && input.estimatedEquityPercent !== undefined
-      ? `DOF valuation shows ~${input.estimatedEquityPercent}% estimated net equity${
-          input.taxLiensCount ? ` alongside ${input.taxLiensCount} active municipal lien filing(s)` : ''
-        }, giving the owner equity room to exit off-market without a short-sale deficiency.`
-      : `Calculated by comparing NYC DOF market valuations against ACRIS recorded mortgages and DOF tax-lien rolls to ensure viable off-market deal spread.`
+  const summary = `Total Score ${totalScore}/100 = ${signalPoints} pts (${triggerLabel}) + ${equityPoints} pts (${
+    hasLiveFinancials ? 'Verified Equity & Liens' : 'Baseline Equity Signal'
+  }) + ${agePoints} pts (${built ? `Built ${built}` : 'Pre-War Baseline'}) + ${agilityPoints} pts (${
+    units ? `${units}-unit ownership` : 'Low-density parcel'
+  }).`
 
   const factors: ScoreFactor[] = [
     {
-      label: `Distress Catalyst: ${triggerLabel}`,
-      weight: `${categoryScore}/100 category tier`,
-      impact: categoryScore >= 89 ? 'High' : 'Moderate',
+      label: `1. Distress Catalyst: ${triggerLabel}`,
+      pointsEarned: signalPoints,
+      maxPoints: 45,
+      weight: `${signalPoints} / 45 pts`,
+      impact: signalPoints >= 40 ? 'High' : 'Moderate',
+      sourceTag: 'NYC ACRIS / Courts / DOF',
+      verified: true,
       detail:
         input.reason ||
         matchedCategory?.description ||
-        'Matched against active municipal legal, tax-lien, and violation filings in NYC public registries.',
+        'Matched against active municipal legal, tax-lien, or distress records in NYC public registries.',
     },
     {
-      label: built ? `Building Age & Hold Cycle (Built ${built})` : 'Building Vintage & Hold Duration',
-      weight: `+${agePoints} PLUTO age pts (+8 stagnation)`,
-      impact: agePoints >= 18 ? 'High' : 'Moderate',
-      detail: built
-        ? `At ${age} years old, this structure approaches peak cap-ex/deferred-maintenance age (+${agePoints} pts out of 25 max) where long-term owners frequently prefer an as-is off-market buyer.`
-        : 'Long-held pre-war or mid-century NYC stock without recent major DOB alterations receives up to +33 structural PLUTO points.',
-    },
-    {
-      label: units ? `Density & Decision Structure (${units} unit${units === 1 ? '' : 's'})` : 'Low-Density Ownership Profile',
-      weight: isLowDensity ? '+12 pts (1–3 units)' : '+5 pts (4+ units)',
-      impact: isLowDensity ? 'High' : 'Supporting',
-      detail: isLowDensity
-        ? '1–3 family properties receive the full +12 ownership agility bonus because decisions come directly from individuals, families, or estate representatives rather than boards.'
-        : `Multi-unit building (${units} units) carries heavier compliance/HPD upkeep pressure, earning +5 density points.`,
-    },
-    {
-      label: 'Equity Cushion & Debt Ratio',
-      weight: 'Financial viability check',
-      impact:
-        input.estimatedEquityPercent !== null && input.estimatedEquityPercent !== undefined && input.estimatedEquityPercent >= 40
-          ? 'High'
-          : 'Moderate',
+      label: '2. Equity Spread & Debt Exposure',
+      pointsEarned: equityPoints,
+      maxPoints: 25,
+      weight: `${equityPoints} / 25 pts`,
+      impact: equityPoints >= 20 ? 'High' : 'Moderate',
+      sourceTag: hasLiveFinancials ? 'Live NYC DOF + ACRIS' : 'Baseline Estimate',
+      verified: hasLiveFinancials,
       detail: equityDetail,
+    },
+    {
+      label: built ? `3. Building Age & Cap-Ex Cycle (Built ${built})` : '3. Building Vintage & Stagnation',
+      pointsEarned: agePoints,
+      maxPoints: 18,
+      weight: `${agePoints} / 18 pts`,
+      impact: agePoints >= 14 ? 'High' : 'Moderate',
+      sourceTag: built ? 'NYC PLUTO + DOB' : 'Baseline Vintage',
+      verified: Boolean(built),
+      detail: built
+        ? `Built in ${built} (${age} yrs old -> ${ageCore}/14 age pts) ${
+            stagnationPoints > 0
+              ? '+ 4/4 pts for no major recent DOB alteration filings, signaling deferred cap-ex pressure.'
+              : '+ 0/4 alteration pts due to recent DOB renovation activity.'
+          }`
+        : `Assigned ${agePoints}/18 pts baseline vintage score until exact PLUTO year-built records load.`,
+    },
+    {
+      label: units ? `4. Ownership & Deal Agility (${units} unit${units === 1 ? '' : 's'})` : '4. Low-Density Ownership Agility',
+      pointsEarned: agilityPoints,
+      maxPoints: 12,
+      weight: `${agilityPoints} / 12 pts`,
+      impact: agilityPoints >= 10 ? 'High' : 'Supporting',
+      sourceTag: units ? 'NYC PLUTO Parcel Class' : 'Parcel Default',
+      verified: Boolean(units),
+      detail:
+        agilityPoints === 12
+          ? '1–3 unit properties earn full 12/12 agility points because individual owners, families, or estate executors can transact directly without condo/co-op board approval.'
+          : agilityPoints === 8
+            ? `Small multifamily (${units} units) earns 8/12 pts: private LLC ownership facing repair/compliance overhead, though slightly slower decision cadence than 1–3 family.`
+            : `Larger multifamily (${units} units) earns 5/12 pts due to multi-partner or corporate sign-off requirements.`,
     },
   ]
 
   const systemPillars = [
     {
-      title: '1. Public Filing & Timeline Urgency',
-      maxPoints: '81–96 tier rank',
+      title: '1. Distress Catalyst & Legal Urgency',
+      maxPoints: 'Up to 45 pts',
+      formula: 'Auction (45) · Tax Lien (43) · Lis Pendens (41) · Probate (38) · Short Sale (36) · REO (35) · Vacant (33) · Expired (30)',
       description:
-        'Each property is classified across 8 NYC distress signals ranked by legal deadline urgency: Foreclosure Auctions (96), Tax-Delinquent Liens (94), Pre-Foreclosures (92), Estate/Probate (89), Short Sales (87), Bank-Owned REO (86), Vacant/HPD (84), and Expired Listings (81).',
+        'Measures how time-sensitive the public filing is. Properties facing imminent court auctions, tax lien sales, or active foreclosure deadlines score highest.',
     },
     {
-      title: '2. PLUTO Structural Baseline',
-      maxPoints: 'Up to 90 base pts',
+      title: '2. Net Equity Cushion & Municipal Liens',
+      maxPoints: 'Up to 25 pts',
+      formula: 'DOF Valuation Spread (9–20 pts) + Active Lien Urgency (2–5 pts)',
       description:
-        'Parcel telemetry starts at 45 base points and adds up to +25 for building age (age ÷ 2), +12 for agile 1–3 unit properties (+5 for larger), and +8 when no major alterations were filed in the last 10 years.',
+        'Checks NYC DOF market value minus ACRIS mortgages and liens so a deal both motivates the seller and leaves room for an off-market transaction.',
     },
     {
-      title: '3. Financial & Lien Validation',
-      maxPoints: 'DOF + ACRIS check',
+      title: '3. Building Vintage & Cap-Ex Stagnation',
+      maxPoints: 'Up to 18 pts',
+      formula: 'Age ÷ 7 (4–14 pts) + No Recent DOB Alterations (+4 pts)',
       description:
-        'Cross-references NYC DOF market assessments against ACRIS mortgages and tax-lien sale notices so high distress scores stay anchored to real equity.',
+        'Uses NYC PLUTO construction year and DOB filings; older, unrenovated buildings carry higher maintenance costs that often trigger as-is sales.',
+    },
+    {
+      title: '4. Ownership Structure & Decision Agility',
+      maxPoints: 'Up to 12 pts',
+      formula: '1–3 Units (12 pts) · 4–10 Units (8 pts) · 11+ Units (5 pts)',
+      description:
+        'Scores how directly a decision-maker can say yes. Small 1–3 family owners/estates move faster than multi-partner commercial entities.',
     },
   ]
 
   return {
     totalScore,
+    equationLabel,
     tier,
     tierColor,
     summary,
+    verificationStatus,
     factors,
     systemPillars,
   }
@@ -272,8 +384,41 @@ export interface MotivationClassification {
   score: number
 }
 
+function buildClassifiedResult(
+  cat: OpportunityCategory,
+  reason: string,
+  opportunityAngle: string,
+  raw: {
+    yearBuilt?: number | null
+    units?: number | null
+    recentAlteration?: boolean | null
+    signals?: string[]
+  }
+): MotivationClassification {
+  const explanation = explainPropertyScore({
+    category: cat.name,
+    reason,
+    yearBuilt: raw.yearBuilt,
+    units: raw.units,
+    recentAlteration: raw.recentAlteration,
+    signals: raw.signals,
+  })
+  return {
+    category: cat.name,
+    categoryNumber: cat.number,
+    subheadline: cat.subheadline,
+    reason,
+    opportunityAngle,
+    badgeBg: cat.badgeBg,
+    badgeText: cat.badgeText,
+    badgeBorder: cat.badgeBorder,
+    score: explanation.totalScore,
+  }
+}
+
 /**
- * Classifies an NYC property signal into one of the 8 canonical distressed/high-motivation seller categories.
+ * Classifies an NYC property signal into one of the 8 canonical distressed/high-motivation seller categories
+ * and computes its transparent 0-100 four-pillar score.
  */
 export function classifyOpportunity(raw: {
   documentType?: string | null
@@ -282,6 +427,9 @@ export function classifyOpportunity(raw: {
   ownerName?: string | null
   address?: string | null
   bbl?: string | null
+  yearBuilt?: number | null
+  units?: number | null
+  recentAlteration?: boolean | null
 }): MotivationClassification {
   const combined = [
     raw.documentType || '',
@@ -301,18 +449,12 @@ export function classifyOpportunity(raw: {
     combined.includes('delinquent') ||
     combined.includes('9rz4-mjek')
   ) {
-    const cat = OPPORTUNITY_CATEGORIES.tax_delinquent
-    return {
-      category: cat.name,
-      categoryNumber: cat.number,
-      subheadline: cat.subheadline,
-      reason: 'NYC DOF Tax Lien Sale notice filed — outstanding municipal debt indicates imminent owner distress.',
-      opportunityAngle: 'Owner must cure delinquency or sell quickly before the lien is securitized at auction.',
-      badgeBg: cat.badgeBg,
-      badgeText: cat.badgeText,
-      badgeBorder: cat.badgeBorder,
-      score: cat.defaultScore,
-    }
+    return buildClassifiedResult(
+      OPPORTUNITY_CATEGORIES.tax_delinquent,
+      'NYC DOF Tax Lien Sale notice filed — outstanding municipal debt indicates imminent owner distress.',
+      'Owner must cure delinquency or sell quickly before the lien is securitized at auction.',
+      raw
+    )
   }
 
   // 2. Foreclosure auctions
@@ -322,18 +464,12 @@ export function classifyOpportunity(raw: {
     combined.includes('referee sale') ||
     combined.includes('jfs')
   ) {
-    const cat = OPPORTUNITY_CATEGORIES.foreclosure_auction
-    return {
-      category: cat.name,
-      categoryNumber: cat.number,
-      subheadline: cat.subheadline,
-      reason: 'Court-issued Judgment of Foreclosure & Sale recorded — scheduled for referee auction.',
-      opportunityAngle: 'Direct auction opportunity or emergency pre-sale buyout before the referee gavel drops.',
-      badgeBg: cat.badgeBg,
-      badgeText: cat.badgeText,
-      badgeBorder: cat.badgeBorder,
-      score: cat.defaultScore,
-    }
+    return buildClassifiedResult(
+      OPPORTUNITY_CATEGORIES.foreclosure_auction,
+      'Court-issued Judgment of Foreclosure & Sale recorded — scheduled for referee auction.',
+      'Direct auction opportunity or emergency pre-sale buyout before the referee gavel drops.',
+      raw
+    )
   }
 
   // 3. Pre-foreclosures
@@ -344,18 +480,12 @@ export function classifyOpportunity(raw: {
     combined.includes('notice of default') ||
     combined.includes('mortgage foreclosure')
   ) {
-    const cat = OPPORTUNITY_CATEGORIES.pre_foreclosure
-    return {
-      category: cat.name,
-      categoryNumber: cat.number,
-      subheadline: cat.subheadline,
-      reason: 'Active Lis Pendens recorded with county clerk — lender has initiated judicial foreclosure proceedings.',
-      opportunityAngle: 'Negotiate directly with owner before auction to structure a payoff or fast equity payout.',
-      badgeBg: cat.badgeBg,
-      badgeText: cat.badgeText,
-      badgeBorder: cat.badgeBorder,
-      score: cat.defaultScore,
-    }
+    return buildClassifiedResult(
+      OPPORTUNITY_CATEGORIES.pre_foreclosure,
+      'Active Lis Pendens recorded with county clerk — lender has initiated judicial foreclosure proceedings.',
+      'Negotiate directly with owner before auction to structure a payoff or fast equity payout.',
+      raw
+    )
   }
 
   // 4. Bank-owned (REO)
@@ -370,18 +500,12 @@ export function classifyOpportunity(raw: {
     combined.includes('us bank national') ||
     combined.includes('jpmorgan chase bank')
   ) {
-    const cat = OPPORTUNITY_CATEGORIES.bank_owned
-    return {
-      category: cat.name,
-      categoryNumber: cat.number,
-      subheadline: cat.subheadline,
-      reason: 'Title held by financial institution or asset manager following foreclosure conveyance.',
-      opportunityAngle: 'Direct acquisition from asset managers motivated to clear non-performing assets off balance sheet.',
-      badgeBg: cat.badgeBg,
-      badgeText: cat.badgeText,
-      badgeBorder: cat.badgeBorder,
-      score: cat.defaultScore,
-    }
+    return buildClassifiedResult(
+      OPPORTUNITY_CATEGORIES.bank_owned,
+      'Title held by financial institution or asset manager following foreclosure conveyance.',
+      'Direct acquisition from asset managers motivated to clear non-performing assets off balance sheet.',
+      raw
+    )
   }
 
   // 5. Estate / probate sales
@@ -396,18 +520,12 @@ export function classifyOpportunity(raw: {
     combined.includes('surrogate') ||
     combined.includes('letters of administration')
   ) {
-    const cat = OPPORTUNITY_CATEGORIES.estate_probate
-    return {
-      category: cat.name,
-      categoryNumber: cat.number,
-      subheadline: cat.subheadline,
-      reason: 'Title held by estate representative / executor following death of original deed holder.',
-      opportunityAngle: 'Estate representatives and heirs typically favor clean cash offers without carrying costs or probate delays.',
-      badgeBg: cat.badgeBg,
-      badgeText: cat.badgeText,
-      badgeBorder: cat.badgeBorder,
-      score: cat.defaultScore,
-    }
+    return buildClassifiedResult(
+      OPPORTUNITY_CATEGORIES.estate_probate,
+      'Title held by estate representative / executor following death of original deed holder.',
+      'Estate representatives and heirs typically favor clean cash offers without carrying costs or probate delays.',
+      raw
+    )
   }
 
   // 6. Vacant properties
@@ -419,18 +537,12 @@ export function classifyOpportunity(raw: {
     combined.includes('order to repair') ||
     combined.includes('unsafe building')
   ) {
-    const cat = OPPORTUNITY_CATEGORIES.vacant_property
-    return {
-      category: cat.name,
-      categoryNumber: cat.number,
-      subheadline: cat.subheadline,
-      reason: 'HPD or DOB emergency inspection noted vacant structure or major code violations with no active occupants.',
-      opportunityAngle: 'Absentee owners carrying high fines and vacant holding costs often welcome off-market exits.',
-      badgeBg: cat.badgeBg,
-      badgeText: cat.badgeText,
-      badgeBorder: cat.badgeBorder,
-      score: cat.defaultScore,
-    }
+    return buildClassifiedResult(
+      OPPORTUNITY_CATEGORIES.vacant_property,
+      'HPD or DOB emergency inspection noted vacant structure or major code violations with no active occupants.',
+      'Absentee owners carrying high fines and vacant holding costs often welcome off-market exits.',
+      raw
+    )
   }
 
   // 7. Short sales / high leverage distress
@@ -440,18 +552,12 @@ export function classifyOpportunity(raw: {
     combined.includes('multiple mortgages') ||
     combined.includes('underwater')
   ) {
-    const cat = OPPORTUNITY_CATEGORIES.short_sale
-    return {
-      category: cat.name,
-      categoryNumber: cat.number,
-      subheadline: cat.subheadline,
-      reason: 'Multiple overlapping recorded encumbrances / mechanic liens relative to assessed value.',
-      opportunityAngle: 'Potential below-market short sale requiring coordinated lender discount negotiation.',
-      badgeBg: cat.badgeBg,
-      badgeText: cat.badgeText,
-      badgeBorder: cat.badgeBorder,
-      score: cat.defaultScore,
-    }
+    return buildClassifiedResult(
+      OPPORTUNITY_CATEGORIES.short_sale,
+      'Multiple overlapping recorded encumbrances / mechanic liens relative to assessed value.',
+      'Potential below-market short sale requiring coordinated lender discount negotiation.',
+      raw
+    )
   }
 
   // Fallback: Cycle intelligently through the motivation categories based on BBL hash
@@ -482,15 +588,5 @@ export function classifyOpportunity(raw: {
     foreclosure_auction: 'Auction notice filed in county supreme court — scheduled for referee bidding within 30 days.',
   }
 
-  return {
-    category: cat.name,
-    categoryNumber: cat.number,
-    subheadline: cat.subheadline,
-    reason: specificReasons[selectedKey],
-    opportunityAngle: cat.description,
-    badgeBg: cat.badgeBg,
-    badgeText: cat.badgeText,
-    badgeBorder: cat.badgeBorder,
-    score: cat.defaultScore,
-  }
+  return buildClassifiedResult(cat, specificReasons[selectedKey], cat.description, raw)
 }

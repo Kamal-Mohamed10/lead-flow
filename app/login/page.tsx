@@ -2,25 +2,34 @@
 
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { ArrowRight, CheckCircle2, Lock, Mail, Sparkles, UserRound } from 'lucide-react'
+import { ArrowRight, CheckCircle2, Lock, Mail, UserRound } from 'lucide-react'
 import { createBrowserClient } from '@supabase/ssr'
 import { useState } from 'react'
+import { prefetchPriorityQueueDiscovery } from '@/lib/propertyStorage'
 
-export default function LoginPage() {
-  const router = useRouter()
-  const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
-  const [name, setName] = useState('')
-  const [authMode, setAuthMode] = useState<'signup' | 'signin'>('signup')
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
+const DEMO_ACCOUNT = {
+  name: 'Kamal Mohamed',
+  email: 'kamal@example.com',
+  password: 'demo',
+}
 
-  function startDemo() {
-    localStorage.setItem('leadflow-workspace-mode', 'agent')
-    localStorage.setItem('leadflow-demo-mode', 'true')
-    localStorage.setItem('leadflow-user-name', 'Demo Agent')
-    localStorage.setItem('leadflow-crm-leads', JSON.stringify([]))
-    localStorage.setItem('leadflow-delivered-opportunity-ids', JSON.stringify([]))
+function enterDemoWorkspace(userName: string) {
+  localStorage.setItem('leadflow-workspace-mode', 'agent')
+  localStorage.setItem('leadflow-demo-mode', 'true')
+  localStorage.setItem('leadflow-user-name', userName)
+
+  const defaultArrayKeys = [
+    'leadflow-crm-leads',
+    'leadflow-explored-catalog',
+    'leadflow-delivered-opportunity-ids',
+  ]
+  for (const key of defaultArrayKeys) {
+    if (localStorage.getItem(key) === null) {
+      localStorage.setItem(key, JSON.stringify([]))
+    }
+  }
+
+  if (localStorage.getItem('leadflow-action-tasks') === null) {
     localStorage.setItem(
       'leadflow-action-tasks',
       JSON.stringify([
@@ -34,19 +43,46 @@ export default function LoginPage() {
         },
       ])
     )
-    router.push('/dashboard')
   }
 
-  async function submit(event: React.FormEvent) {
+  if (localStorage.getItem('leadflow-batch-unlock-time') === null) {
+    localStorage.setItem('leadflow-batch-unlock-time', String(Date.now() + 3600 * 1000))
+  }
+
+  window.dispatchEvent(new Event('leadflow-demo-mode-change'))
+}
+
+export default function LoginPage() {
+  const router = useRouter()
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [name, setName] = useState('')
+  const [authMode, setAuthMode] = useState<'signup' | 'signin'>('signup')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+
+  async function submit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
     setLoading(true)
     setError('')
+    const formData = new FormData(event.currentTarget)
+    const submittedName = String(formData.get('name') ?? name).trim()
+    const submittedEmail = String(formData.get('email') ?? email).trim()
+    const submittedPassword = String(formData.get('password') ?? password)
+
     localStorage.setItem('leadflow-workspace-mode', 'agent')
-    if (name.trim()) localStorage.setItem('leadflow-user-name', name.trim())
+    if (submittedName) localStorage.setItem('leadflow-user-name', submittedName)
     const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL
     const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
     if (!supabaseUrl || !supabaseAnonKey) {
-      setError('Supabase authentication is not configured.')
+      if (submittedEmail.toLowerCase() === DEMO_ACCOUNT.email && submittedPassword === DEMO_ACCOUNT.password) {
+        const displayName = authMode === 'signup' && submittedName ? submittedName : DEMO_ACCOUNT.name
+        enterDemoWorkspace(displayName)
+        void prefetchPriorityQueueDiscovery()
+        router.push('/dashboard')
+        return
+      }
+      setError('Invalid email or password.')
       setLoading(false)
       return
     }
@@ -56,16 +92,19 @@ export default function LoginPage() {
       const { data, error: authError } =
         authMode === 'signup'
           ? await supabase.auth.signUp({
-              email,
-              password,
+              email: submittedEmail,
+              password: submittedPassword,
               options: {
                 data: {
-                  full_name: name.trim(),
+                  full_name: submittedName,
                   workspace_mode: 'agent',
                 },
               },
             })
-          : await supabase.auth.signInWithPassword({ email, password })
+          : await supabase.auth.signInWithPassword({
+              email: submittedEmail,
+              password: submittedPassword,
+            })
 
       if (authError) {
         setError(authError.message)
@@ -103,13 +142,13 @@ export default function LoginPage() {
             <span className="italic font-normal text-[#8edbb8]">Before Anyone Else.</span>
           </h1>
           <p className="mt-6 max-w-lg text-base leading-relaxed text-slate-300">
-            Official NYC public registry mining, forensic equity spreads, Do-Not-Call compliance, and 1-click tailored direct mail letters for New York acquisition specialists.
+            Official NYC public registry mining, forensic equity spreads, and verified owner info so you can reach out directly.
           </p>
           <ul className="mt-8 space-y-3 text-sm text-slate-200">
             {[
               'NYC ACRIS, DOF Tax Liens & HPD Distress Mining',
-              'Eight Tailored Seller Motivation Categories',
-              'Automated DNC Scrubbing & 1-Click Direct Mail Letters',
+              'Priority Queue & Transparent 0–100 Scoring',
+              'Verified Owner Lookup & Agent Notes',
             ].map((feature) => (
               <li key={feature} className="flex items-center gap-2.5 font-medium">
                 <CheckCircle2 className="size-4.5 text-[#8edbb8] shrink-0" />
@@ -121,6 +160,8 @@ export default function LoginPage() {
 
         <form
           onSubmit={submit}
+          method="post"
+          autoComplete="on"
           className="mx-auto w-full max-w-md rounded-[28px] bg-white p-8 text-[#172b2a] shadow-2xl border border-slate-100"
         >
           <h2 className="font-serif text-2xl font-bold tracking-tight text-[#172b2a]">
@@ -138,36 +179,16 @@ export default function LoginPage() {
             </p>
           )}
 
-          <button
-            type="button"
-            onClick={startDemo}
-            className="mt-6 flex w-full items-center justify-between rounded-xl border border-emerald-200/80 bg-[#edf7f2] p-4 text-left transition hover:bg-[#dff2e8]"
-          >
-            <span className="flex items-center gap-3">
-              <span className="grid size-9 place-items-center rounded-lg bg-[#176b4d] text-white shadow-xs">
-                <Sparkles className="size-4" />
-              </span>
-              <span>
-                <span className="block text-sm font-black text-[#172b2a]">Launch Live NYC Demo</span>
-                <span className="block text-[11px] text-[#176b4d] font-bold">Explore live feed instantly · No account needed</span>
-              </span>
-            </span>
-            <ArrowRight className="size-4 text-[#176b4d]" />
-          </button>
-
-          <div className="my-5 flex items-center gap-3 text-[10px] font-bold uppercase tracking-widest text-slate-400">
-            <span className="h-px flex-1 bg-slate-200" />
-            <span>Or Continue With Credentials</span>
-            <span className="h-px flex-1 bg-slate-200" />
-          </div>
-
-          <div className="space-y-4">
+          <div className="mt-6 space-y-4">
             {authMode === 'signup' && (
-              <label className="block text-xs font-bold text-slate-600">
+              <label htmlFor="login-name" className="block text-xs font-bold text-slate-600">
                 Your full name
                 <span className="mt-1.5 flex items-center rounded-xl border border-slate-200 px-3.5 focus-within:border-[#176b4d]">
                   <UserRound className="size-4 text-slate-400" />
                   <input
+                    id="login-name"
+                    name="name"
+                    autoComplete="name"
                     required
                     value={name}
                     onChange={(event) => setName(event.target.value)}
@@ -178,26 +199,41 @@ export default function LoginPage() {
               </label>
             )}
 
-            <label className="block text-xs font-bold text-slate-600">
+            <label htmlFor="login-email" className="block text-xs font-bold text-slate-600">
               Email address
               <span className="mt-1.5 flex items-center rounded-xl border border-slate-200 px-3.5 focus-within:border-[#176b4d]">
                 <Mail className="size-4 text-slate-400" />
                 <input
+                  id="login-email"
+                  name="email"
+                  autoComplete={authMode === 'signin' ? 'username' : 'email'}
                   required
                   type="email"
                   value={email}
-                  onChange={(event) => setEmail(event.target.value)}
+                  onChange={(event) => {
+                    const nextEmail = event.target.value
+                    setEmail(nextEmail)
+                    if (
+                      nextEmail.trim().toLowerCase() === DEMO_ACCOUNT.email &&
+                      (!process.env.NEXT_PUBLIC_SUPABASE_URL || !process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY)
+                    ) {
+                      void prefetchPriorityQueueDiscovery()
+                    }
+                  }}
                   placeholder="agent@example.com"
                   className="h-11 min-w-0 flex-1 bg-transparent px-3 text-sm text-[#172b2a] outline-none placeholder:text-slate-400"
                 />
               </span>
             </label>
 
-            <label className="block text-xs font-bold text-slate-600">
+            <label htmlFor="login-password" className="block text-xs font-bold text-slate-600">
               Password
               <span className="mt-1.5 flex items-center rounded-xl border border-slate-200 px-3.5 focus-within:border-[#176b4d]">
                 <Lock className="size-4 text-slate-400" />
                 <input
+                  id="login-password"
+                  name="password"
+                  autoComplete={authMode === 'signup' ? 'new-password' : 'current-password'}
                   required
                   type="password"
                   value={password}

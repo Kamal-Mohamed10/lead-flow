@@ -68,10 +68,12 @@ export default function AgentNotesPage() {
 
     const byId = new Map<string, KnownProperty>()
     try {
-      const crm = JSON.parse(localStorage.getItem('leadflow-crm-leads') || '[]')
-      if (Array.isArray(crm)) {
-        for (const item of crm) {
-          if (item?.id && item?.address) byId.set(item.id, item)
+      for (const storageKey of ['leadflow-crm-leads', 'leadflow-explored-catalog']) {
+        const items = JSON.parse(localStorage.getItem(storageKey) || '[]')
+        if (Array.isArray(items)) {
+          for (const item of items) {
+            if (item?.id && item?.address && !byId.has(item.id)) byId.set(item.id, item)
+          }
         }
       }
       for (let i = 0; i < localStorage.length; i++) {
@@ -215,7 +217,7 @@ export default function AgentNotesPage() {
       setShowGenerator(false)
       setNotes(loadAgentNotes())
     } catch (error) {
-      setCompileError(error instanceof Error ? error.message : 'Unable to generate AI log entry.')
+      setCompileError(error instanceof Error ? error.message : 'Unable to save property note.')
     } finally {
       setCompiling(false)
     }
@@ -248,13 +250,13 @@ export default function AgentNotesPage() {
       <div className="flex flex-wrap items-end justify-between gap-4 border-b border-slate-200/80 pb-5">
         <div>
           <p className="mb-1 text-xs font-bold uppercase tracking-[0.22em] text-[#176b4d]">
-            Research Log · AI Compiled
+            Research Log
           </p>
           <h1 className="font-serif text-3xl font-black italic tracking-tight text-[#172b2a] sm:text-4xl">
             Agent Notes
           </h1>
           <p className="mt-1 text-sm text-slate-500">
-            Structured AI log of off-market properties once an owner is found — including address, owner name, contact info, property brief, and motivating factor.
+            Structured log of off-market properties once an owner is found — including address, owner name, contact info, property brief, and motivating factor.
           </p>
         </div>
 
@@ -274,26 +276,26 @@ export default function AgentNotesPage() {
             onClick={() => setShowGenerator((v) => !v)}
             className="flex items-center gap-1.5 rounded-xl bg-[#176b4d] px-4 py-2.5 text-xs font-bold text-white shadow-xs transition hover:bg-[#12543d]"
           >
-            <Sparkles className="size-3.5" />
-            <span>{showGenerator ? 'Close AI Compiler' : 'AI Add Property Note'}</span>
+            <NotebookPen className="size-3.5" />
+            <span>{showGenerator ? 'Close Note Builder' : 'Add Property Note'}</span>
           </button>
         </div>
       </div>
 
-      {/* AI Auto-Compile Panel */}
+      {/* Note Builder Panel */}
       {showGenerator && (
         <section className="rounded-2xl border border-emerald-200 bg-white p-6 shadow-sm">
           <div className="flex items-start justify-between gap-4 border-b border-slate-100 pb-4">
             <div>
               <p className="flex items-center gap-1.5 text-xs font-black uppercase tracking-wider text-[#176b4d]">
-                <Sparkles className="size-3.5" />
-                AI Agent Note Builder
+                <NotebookPen className="size-3.5" />
+                Agent Note Builder
               </p>
               <h2 className="mt-1 text-lg font-black text-[#172b2a]">
-                Compile Property, Owner &amp; Motivation Log with AI
+                Save Property, Owner &amp; Motivation Log
               </h2>
               <p className="mt-0.5 text-xs text-slate-500">
-                Choose a researched property (or add any newly found owner phone/email) and AI will structure the full log entry.
+                Choose a researched property (or add any newly found owner phone/email) to structure and save the full log entry.
               </p>
             </div>
             <button
@@ -338,7 +340,7 @@ export default function AgentNotesPage() {
               </div>
 
               <label className="block text-xs font-bold text-slate-600">
-                Owner Name (Optional — AI checks NYC records if blank)
+                Owner Name (Optional — checks NYC records if blank)
                 <input
                   type="text"
                   value={customOwnerName}
@@ -374,12 +376,12 @@ export default function AgentNotesPage() {
                   {compiling ? (
                     <>
                       <RefreshCw className="size-3.5 animate-spin" />
-                      <span>AI Compiling Entry...</span>
+                      <span>Saving Entry...</span>
                     </>
                   ) : (
                     <>
-                      <Sparkles className="size-3.5 text-emerald-300" />
-                      <span>Compile &amp; Save to Agent Notes</span>
+                      <NotebookPen className="size-3.5 text-emerald-300" />
+                      <span>Save to Agent Notes</span>
                     </>
                   )}
                 </button>
@@ -427,7 +429,7 @@ export default function AgentNotesPage() {
             <h2 className="font-serif text-xl font-bold italic text-[#172b2a]">No Agent Notes Logged Yet</h2>
             <p className="text-xs leading-relaxed text-slate-500">
               Open any property report, click <strong>Find Owner</strong> to retrieve the recorded owner and contact details, and click{' '}
-              <strong>AI Save to Agent Notes</strong> — AI will automatically log the address, owner name, contact info, brief property description, and motivating factor here.
+              <strong>Save to Agent Notes</strong> to log the address, owner name, contact info, brief property description, and motivating factor here.
             </p>
           </div>
           <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
@@ -437,7 +439,7 @@ export default function AgentNotesPage() {
               className="flex items-center gap-1.5 rounded-xl bg-[#176b4d] px-4 py-2.5 text-xs font-bold text-white shadow-xs hover:bg-[#12543d]"
             >
               <Plus className="size-3.5" />
-              <span>AI Add Property Note</span>
+              <span>Add Property Note</span>
             </button>
             <Link
               href="/dashboard/watchlist"
@@ -486,15 +488,6 @@ export default function AgentNotesPage() {
                         </span>
                         <span>•</span>
                         <span>Logged {new Date(entry.createdAt).toLocaleString()}</span>
-                        {entry.aiGenerated && (
-                          <>
-                            <span>•</span>
-                            <span className="inline-flex items-center gap-1 font-semibold text-[#176b4d]">
-                              <Sparkles className="size-3" />
-                              AI Compiled ({entry.modelUsed || 'LeadFlow AI'})
-                            </span>
-                          </>
-                        )}
                       </p>
                     </div>
                   </div>

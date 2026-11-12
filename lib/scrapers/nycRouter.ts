@@ -1,7 +1,9 @@
 import { getSupabaseAdminClient } from '@/lib/auth'
 
 const SOCRATA_RESOURCE_URL = 'https://data.cityofnewyork.us/resource'
-const SOURCE_TIMEOUT_MS = 12_000
+const SOURCE_TIMEOUT_MS = 10_000
+const DISCOVERY_TIMEOUT_MS = 6_000
+const CASCADE_TIMEOUT_MS = 4_000
 const MAX_SOURCE_LIMIT = 100
 const ASSIGNMENT_PAGE_SIZE = 500
 
@@ -187,7 +189,7 @@ function randomOffset(): number {
 
 async function fetchSocrataRows(
   datasetId: string,
-  options: { limit: number; offset?: number; where?: string; orderField?: string }
+  options: { limit: number; offset?: number; where?: string; orderField?: string; timeoutMs?: number }
 ): Promise<SocrataRow[]> {
   const query = new URLSearchParams({
     '$limit': String(Math.min(Math.max(Math.floor(options.limit), 1), MAX_SOURCE_LIMIT)),
@@ -204,7 +206,7 @@ async function fetchSocrataRows(
   const response = await fetch(`${SOCRATA_RESOURCE_URL}/${datasetId}.json?${query}`, {
     headers,
     cache: 'no-store',
-    signal: AbortSignal.timeout(SOURCE_TIMEOUT_MS),
+    signal: AbortSignal.timeout(options.timeoutMs || SOURCE_TIMEOUT_MS),
   })
   if (!response.ok) {
     throw new Error(`NYC Open Data ${datasetId} returned HTTP ${response.status}.`)
@@ -226,7 +228,12 @@ async function fetchOptionalRows(
   limit = 10
 ): Promise<SocrataRow[]> {
   try {
-    return await fetchSocrataRows(datasetId, { limit, where, orderField: ':id' })
+    return await fetchSocrataRows(datasetId, {
+      limit,
+      where,
+      orderField: ':id',
+      timeoutMs: CASCADE_TIMEOUT_MS,
+    })
   } catch (error) {
     console.warn(
       `NYC data cascade skipped ${sourceName}:`,
@@ -420,32 +427,58 @@ async function cascadeDetails(
   let buildingDetails = buildingDetailsFromRow(initialRow)
   let documentId = value(initialRow, 'document_id', 'crfn')
 
+  const needsPluto = !address || !hasBuildingDetails(buildingDetails) || !ownerName
+
+  // Fetch ACRIS master, HPD violations, and MapPLUTO parcel metadata concurrently
+  const [masterRows, hpdRows, plutoRows] = await Promise.all([
+    initialSource.name === 'ACRIS Real Property Master' && documentId
+      ? fetchOptionalRows(
+          'ACRIS Real Property Master',
+          ACRIS_MASTER_ID,
+          `document_id='${soqlLiteral(documentId)}'`,
+          3
+        )
+      : Promise.resolve<SocrataRow[]>([]),
+    fetchOptionalRows(
+      'HPD Housing Violations',
+      HPD_VIOLATIONS_ID,
+      `bbl='${bbl}'`,
+      10
+    ),
+    needsPluto
+      ? fetchOptionalRows(
+          'MapPLUTO Land Use',
+          MAPPLUTO_ID,
+          `bbl='${bbl}'`,
+          2
+        )
+      : Promise.resolve<SocrataRow[]>([]),
+  ])
+
   if (initialSource.name === 'ACRIS Real Property Master') {
     const legalRows = [initialRow]
-    if (documentId) {
-      const masterRows = await fetchOptionalRows(
-        'ACRIS Real Property Master',
-        ACRIS_MASTER_ID,
-        `document_id='${soqlLiteral(documentId)}'`,
-        3
-      )
-      if (masterRows.length) {
-        supplements['ACRIS Real Property Master'] = masterRows
-        appendSource(sources, 'ACRIS Real Property Master')
-        documentId = documentId || value(masterRows[0], 'document_id')
-      }
+    if (masterRows.length) {
+      supplements['ACRIS Real Property Master'] = masterRows
+      appendSource(sources, 'ACRIS Real Property Master')
+      documentId = documentId || value(masterRows[0], 'document_id')
     }
     const legalRow = legalRows.find((row) => normalizeBbl(row) === bbl) || initialRow
     borough = borough || boroughIdentifier(value(legalRow, 'borough', 'recorded_borough'))
     address = address || addressFromRow(legalRow)
   }
 
-  const hpdRows = await fetchOptionalRows(
-    'HPD Housing Violations',
-    HPD_VIOLATIONS_ID,
-    `bbl='${bbl}'`,
-    10
-  )
+  const pluto = plutoRows[0]
+  if (pluto) {
+    supplements['MapPLUTO Land Use'] = plutoRows
+    appendSource(sources, 'MapPLUTO Land Use')
+    address = address || addressFromRow(pluto)
+    borough = borough || boroughIdentifier(value(pluto, 'borocode', 'borough'))
+    zipCode = zipCode || value(pluto, 'zipcode')
+    propertyType = propertyType || value(pluto, 'bldgclass', 'landuse')
+    ownerName = ownerName || ownerFromRow(pluto)
+    buildingDetails = { ...buildingDetailsFromRow(pluto), ...buildingDetails }
+  }
+
   if (hpdRows.length) {
     supplements['HPD Housing Violations'] = hpdRows
     appendSource(sources, 'HPD Housing Violations')
@@ -456,19 +489,23 @@ async function cascadeDetails(
             .map((row) => value(row, 'registrationid'))
             .filter((id): id is string => Boolean(id))
         ),
-      ].slice(0, 3)
-      for (const registrationId of registrationIds) {
-        const contacts = await fetchOptionalRows(
-          'HPD Registration Contacts',
-          HPD_CONTACTS_ID,
-          `registrationid='${soqlLiteral(registrationId)}'`,
-          10
+      ].slice(0, 2)
+      if (registrationIds.length) {
+        const contactBatches = await Promise.all(
+          registrationIds.map((registrationId) =>
+            fetchOptionalRows(
+              'HPD Registration Contacts',
+              HPD_CONTACTS_ID,
+              `registrationid='${soqlLiteral(registrationId)}'`,
+              10
+            )
+          )
         )
-        if (contacts.length) {
+        const contacts = contactBatches.find((batch) => batch.length > 0)
+        if (contacts) {
           supplements['HPD Registration Contacts'] = contacts
           appendSource(sources, 'HPD Registration Contacts')
           ownerName = contacts.map(ownerFromRow).find(Boolean) || null
-          if (ownerName) break
         }
       }
     }
@@ -495,51 +532,38 @@ async function cascadeDetails(
             .map((row) => value(row, 'document_id'))
             .filter((id): id is string => Boolean(id))
         ),
-      ].slice(0, 3)
+      ].slice(0, 2)
 
-      for (const id of documentIds) {
-        const parties = await fetchOptionalRows(
-          'ACRIS Parties',
-          ACRIS_PARTIES_ID,
-          `document_id='${soqlLiteral(id)}'`,
-          20
+      if (documentIds.length) {
+        const partyBatches = await Promise.all(
+          documentIds.map((id) =>
+            fetchOptionalRows(
+              'ACRIS Parties',
+              ACRIS_PARTIES_ID,
+              `document_id='${soqlLiteral(id)}'`,
+              20
+            )
+          )
         )
-        if (!parties.length) continue
-        supplements['ACRIS Parties'] = [
-          ...(supplements['ACRIS Parties'] || []),
-          ...parties,
-        ]
-        appendSource(sources, 'ACRIS Parties')
-        const preferred = parties.find((party) =>
-          (value(party, 'party_type') || '').toLowerCase().includes('grantee')
-        )
-        ownerName =
-          ownerFromRow(preferred || parties[0]) ||
-          parties.map(ownerFromRow).find(Boolean) ||
-          null
-        if (ownerName) break
+        for (const parties of partyBatches) {
+          if (!parties.length) continue
+          supplements['ACRIS Parties'] = [
+            ...(supplements['ACRIS Parties'] || []),
+            ...parties,
+          ]
+          appendSource(sources, 'ACRIS Parties')
+          if (!ownerName) {
+            const preferred = parties.find((party) =>
+              (value(party, 'party_type') || '').toLowerCase().includes('grantee')
+            )
+            ownerName =
+              ownerFromRow(preferred || parties[0]) ||
+              parties.map(ownerFromRow).find(Boolean) ||
+              null
+          }
+        }
       }
       documentId = documentId || value(acrisDocuments[0], 'document_id')
-    }
-  }
-
-  if (!address || !hasBuildingDetails(buildingDetails)) {
-    const plutoRows = await fetchOptionalRows(
-      'MapPLUTO Land Use',
-      MAPPLUTO_ID,
-      `bbl='${bbl}'`,
-      2
-    )
-    const pluto = plutoRows[0]
-    if (pluto) {
-      supplements['MapPLUTO Land Use'] = plutoRows
-      appendSource(sources, 'MapPLUTO Land Use')
-      address = address || addressFromRow(pluto)
-      borough = borough || boroughIdentifier(value(pluto, 'borocode', 'borough'))
-      zipCode = zipCode || value(pluto, 'zipcode')
-      propertyType = propertyType || value(pluto, 'bldgclass', 'landuse')
-      ownerName = ownerName || ownerFromRow(pluto)
-      buildingDetails = { ...buildingDetailsFromRow(pluto), ...buildingDetails }
     }
   }
 
@@ -614,6 +638,7 @@ async function discoverSignals(
           offset: randomOffset(),
           where: source.filter,
           orderField: source.orderField,
+          timeoutMs: DISCOVERY_TIMEOUT_MS,
         })
         successfulSources += 1
         return { source, rows }
